@@ -8,6 +8,7 @@ import (
 	"github.com/borchero/switchboard/internal/k8s"
 	"github.com/borchero/switchboard/internal/switchboard"
 	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,15 +40,31 @@ func (*externalDNS) OwnedResource() client.Object {
 	return &externaldnsv1alpha1.DNSEndpoint{}
 }
 
-func (e *externalDNS) WatchedObject() client.Object {
+func (e *externalDNS) WatchedObjects() []client.Object {
 	name := e.target.NamespacedName()
 	if name == nil {
 		return nil
 	}
-	return &v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name.Name,
-			Namespace: name.Namespace,
+	return []client.Object{
+		// Reconcile on changes of the target service itself (e.g. load balancer status updates
+		// or when the service is switched between headless and a regular cluster IP service).
+		&v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name.Name,
+				Namespace: name.Namespace,
+			},
+		},
+		// Reconcile on changes of the endpoint slices of the target service: for headless
+		// services, the published DNS targets are aggregated from the ready slice addresses.
+		// Slices are matched by the `kubernetes.io/service-name` label (slice names are
+		// generated and not known upfront).
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: name.Namespace,
+				Labels: map[string]string{
+					discoveryv1.LabelServiceName: name.Name,
+				},
+			},
 		},
 	}
 }
@@ -69,6 +86,17 @@ func (e *externalDNS) UpdateResource(
 	targets, err := e.target.Targets(ctx, e.client)
 	if err != nil {
 		return fmt.Errorf("failed to query IP for DNS A record: %w", err)
+	}
+
+	// If there are no targets (e.g. a headless service has no ready endpoints), a stale DNS
+	// endpoint must not continue to be published. We delete it and rely on the watch on the
+	// target's endpoint slices to recreate it automatically once addresses become available.
+	if len(targets) == 0 {
+		dnsEndpoint := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
+		if err := k8s.DeleteIfFound(ctx, e.client, &dnsEndpoint); err != nil {
+			return fmt.Errorf("failed to delete DNS endpoint without targets: %w", err)
+		}
+		return nil
 	}
 
 	// Create the endpoint resource

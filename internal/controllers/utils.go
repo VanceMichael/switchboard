@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -10,9 +11,11 @@ import (
 	"github.com/borchero/switchboard/internal/k8s"
 	"github.com/borchero/switchboard/internal/switchboard"
 	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func integrationsFromConfig(
@@ -62,9 +65,9 @@ func builderWithIntegrations(
 
 	// Watch for dependent resources if required
 	for _, itg := range integrations {
-		if itg.WatchedObject() != nil {
+		for _, watched := range itg.WatchedObjects() {
 			var list traefik.IngressRouteList
-			enqueue := k8s.EnqueueMapFunc(ctrlClient, logger, itg.WatchedObject(), &list,
+			enqueue := watchEnqueueFunc(ctrlClient, logger, watched, &list,
 				func(list *traefik.IngressRouteList) []client.Object {
 					return ext.Map(list.Items, func(v traefik.IngressRoute) client.Object {
 						return &v
@@ -72,11 +75,44 @@ func builderWithIntegrations(
 				},
 			)
 			builder = builder.Watches(
-				itg.WatchedObject(),
+				watched,
 				handler.EnqueueRequestsFromMapFunc(enqueue),
 			)
 		}
 	}
 
 	return builder
+}
+
+// watchEnqueueFunc builds the mapping function for a watched object. Endpoint slices are matched
+// by namespace and the `kubernetes.io/service-name` label (their generated names are not known
+// upfront and a service may own multiple slices). All other watched objects are matched by their
+// exact name and namespace.
+func watchEnqueueFunc[L client.ObjectList](
+	ctrlClient client.Client,
+	logger *slog.Logger,
+	watched client.Object,
+	list L,
+	getItems func(L) []client.Object,
+) func(ctx context.Context, obj client.Object) []reconcile.Request {
+	if slice, ok := watched.(*discoveryv1.EndpointSlice); ok {
+		labels := slice.GetLabels()
+		namespace := slice.GetNamespace()
+		return k8s.EnqueueMapFuncMatching(
+			ctrlClient, logger,
+			func(obj client.Object) bool {
+				if obj.GetNamespace() != namespace {
+					return false
+				}
+				for key, value := range labels {
+					if obj.GetLabels()[key] != value {
+						return false
+					}
+				}
+				return true
+			},
+			list, getItems,
+		)
+	}
+	return k8s.EnqueueMapFunc(ctrlClient, logger, watched, list, getItems)
 }

@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: p2p
+    text: 未配置 target Service 或目标为静态地址、hostname annotation、LoadBalancer hostname/IP、普通 ClusterIP 时，现有优先级、双栈去重、Service 更新触发和 DNSEndpoint 结果保持固定版本兼容。
+  - id: 2
+    type: f2p
+    text: 目标为 headless Service 时，从属于该 Service 的 EndpointSlice 汇总 ready 且未终止的 IPv4/IPv6 地址，稳定去重写入 DNSEndpoint，并且绝不把 None 或其他 Service 的地址作为 target。
+  - id: 3
+    type: f2p
+    text: 相关 EndpointSlice 的创建、地址/readiness 更新和删除会通过 manager watch 精确 enqueue 依赖该 target Service 的 IngressRoute；无关切片不会造成错误资源变化。
+  - id: 4
+    type: f2p
+    text: 所有切片暂时没有可发布地址或被删除时，已有 DNSEndpoint 被撤销而不是保留陈旧记录；ready 地址恢复后同一 IngressRoute 自动重新创建正确记录。
+  - id: 5
+    type: f2p
+    text: Service 在 headless、普通 ClusterIP、LoadBalancer 与 hostname annotation 之间转换时，旧来源的地址被替换或清理，切回任一来源后按既有优先级恢复且不会累积重复 target。
+  - id: 6
+    type: f2p
+    text: 运行所需的 EndpointSlice scheme、list/get/watch 权限和 chart 模板完整接线；缺失权限或 API 读取失败返回可重试错误，不会把缓存中的旧地址伪装成成功收敛。
+  - id: 7
+    type: p2p
+    text: Certificate integration、IngressRoute host/TLS 提取、owned-resource reconcile、现有 external-dns Service 测试及 Helm 安装渲染保持回归通过。

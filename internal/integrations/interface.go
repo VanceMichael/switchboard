@@ -29,11 +29,12 @@ type Integration interface {
 	// owns. The resource should be "empty", i.e. no fields should be set.
 	OwnedResource() client.Object
 
-	// WatchedObject optionally returns a particular object whose changes require the
-	// reconciliation of all resources that this integration is applied to. In contrast to
-	// `OwnedResource`, this method returns a concrete object (i.e. its name and namespace must
-	// set set). If the integration does not watch any resources, this method may return `nil`.
-	WatchedObject() client.Object
+	// WatchedObjects optionally returns objects whose changes require the reconciliation of all
+	// resources that this integration is applied to. In contrast to `OwnedResource`, the
+	// returned objects are "concrete" (i.e. their name and namespace must be set for objects
+	// matched by name, and labels must be set for objects matched by labels). If the
+	// integration does not watch any resources, this method may return an empty slice.
+	WatchedObjects() []client.Object
 
 	// UpdateResource updates the resource that ought to be owned by the passed object. Updating
 	// may entail creating the resource, updating an existing resource, or deleting the resouce.

@@ -31,7 +31,7 @@ func (*certManager) OwnedResource() client.Object {
 	return &certmanager.Certificate{}
 }
 
-func (*certManager) WatchedObject() client.Object {
+func (*certManager) WatchedObjects() []client.Object {
 	return nil
 }
 

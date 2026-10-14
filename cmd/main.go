@@ -10,6 +10,7 @@ import (
 	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/go-logr/logr"
 	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -100,6 +101,7 @@ func main() {
 
 func initScheme(config configv1.Config, scheme *runtime.Scheme) {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(discoveryv1.AddToScheme(scheme))
 	utilruntime.Must(traefik.AddToScheme(scheme))
 
 	if config.Integrations.CertManager != nil {

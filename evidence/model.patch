@@ -1,0 +1,1280 @@
+diff --git a/chart/templates/rbac.yaml b/chart/templates/rbac.yaml
+index 69ef4f7..d76eb47 100644
+--- a/chart/templates/rbac.yaml
++++ b/chart/templates/rbac.yaml
+@@ -26,6 +26,9 @@ rules:
+   - apiGroups: [""]
+     resources: ["services"]
+     verbs: ["get", "list", "watch"]
++  - apiGroups: ["discovery.k8s.io"]
++    resources: ["endpointslices"]
++    verbs: ["get", "list", "watch"]
+   {{ end }}
+   # Leader Election
+   - apiGroups: [""]
+diff --git a/cmd/main.go b/cmd/main.go
+index 1a45176..d6fb3b2 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -10,6 +10,7 @@ import (
+ 	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+ 	"github.com/go-logr/logr"
+ 	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	discoveryv1 "k8s.io/api/discovery/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+@@ -100,6 +101,7 @@ func main() {
+ 
+ func initScheme(config configv1.Config, scheme *runtime.Scheme) {
+ 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
++	utilruntime.Must(discoveryv1.AddToScheme(scheme))
+ 	utilruntime.Must(traefik.AddToScheme(scheme))
+ 
+ 	if config.Integrations.CertManager != nil {
+diff --git a/internal/controllers/ingressroute_headless_test.go b/internal/controllers/ingressroute_headless_test.go
+new file mode 100644
+index 0000000..8931e1a
+--- /dev/null
++++ b/internal/controllers/ingressroute_headless_test.go
+@@ -0,0 +1,236 @@
++package controllers
++
++import (
++	"context"
++	"log/slog"
++	"testing"
++
++	configv1 "github.com/borchero/switchboard/internal/config/v1"
++	"github.com/borchero/switchboard/internal/k8tests"
++	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	v1 "k8s.io/api/core/v1"
++	discoveryv1 "k8s.io/api/discovery/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	controllerruntime "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	externaldnsv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
++)
++
++// reconcileWithClient runs a single reconciliation pass against the provided (fake) client.
++func reconcileWithClient(
++	ctx context.Context, t *testing.T,
++	ctrlClient client.Client, ingress traefik.IngressRoute, config configv1.Config,
++) {
++	reconciler, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), config)
++	require.Nil(t, err)
++	_, err = reconciler.Reconcile(ctx, controllerruntime.Request{
++		NamespacedName: types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace},
++	})
++	require.Nil(t, err)
++}
++
++func boolPtr(value bool) *bool {
++	return &value
++}
++
++func headlessService(name, namespace string) v1.Service {
++	return v1.Service{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
++		Spec: v1.ServiceSpec{
++			ClusterIP:  v1.ClusterIPNone,
++			ClusterIPs: []string{v1.ClusterIPNone},
++			Ports:      []v1.ServicePort{{Port: 80, Name: "http"}},
++		},
++	}
++}
++
++func endpointSlice(
++	name, namespace, serviceName string, addressType discoveryv1.AddressType,
++	ready bool, addresses ...string,
++) discoveryv1.EndpointSlice {
++	return discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
++		},
++		AddressType: addressType,
++		Endpoints: []discoveryv1.Endpoint{{
++			Addresses:  addresses,
++			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
++		}},
++	}
++}
++
++func headlessIngressRoute(name, namespace string) traefik.IngressRoute {
++	return traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind:  "Rule",
++				Match: "Host(`www.example.com`)",
++				Services: []traefik.Service{{
++					LoadBalancerSpec: traefik.LoadBalancerSpec{Name: "nginx"},
++				}},
++			}},
++			TLS: &traefik.TLS{SecretName: "www-tls-certificate"},
++		},
++	}
++}
++
++func TestReconcileHeadlessServiceEndpointSlices(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	const namespace = "ns"
++
++	service := headlessService("traefik", namespace)
++	ingress := headlessIngressRoute("my-ingress", namespace)
++
++	ipv4Slice := endpointSlice("traefik-v4", namespace, service.Name,
++		discoveryv1.AddressTypeIPv4, true, "10.0.1.1", "10.0.1.2")
++	ipv6Slice := endpointSlice("traefik-v6", namespace, service.Name,
++		discoveryv1.AddressTypeIPv6, true, "2001:db8::1")
++	// Slice of an unrelated service must never contribute targets.
++	otherSlice := endpointSlice("other-v4", namespace, "other-service",
++		discoveryv1.AddressTypeIPv4, true, "10.0.9.9")
++
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
++		&service, &ingress, &ipv4Slice, &ipv6Slice, &otherSlice,
++	).Build()
++	config := createConfig(&service)
++
++	reconcileWithClient(ctx, t, ctrlClient, ingress, config)
++
++	// The DNS endpoint must publish the ready IPv4/IPv6 addresses of the target's slices and
++	// the certificate integration must still work unchanged.
++	dnsEndpoint := getDNSEndpoint(t, ctx, ctrlClient, ingress)
++	targets := dnsTargetsByRecord(dnsEndpoint)
++	assert.ElementsMatch(t, []string{"10.0.1.1", "10.0.1.2"}, targets["A"])
++	assert.ElementsMatch(t, []string{"2001:db8::1"}, targets["AAAA"])
++	assert.NotContains(t, targets, "CNAME")
++	for _, ep := range dnsEndpoint.Spec.Endpoints {
++		for _, address := range ep.Targets {
++			assert.NotEqual(t, v1.ClusterIPNone, address)
++		}
++	}
++	certificate := getCertificate(t, ctx, ctrlClient, namespace, "my-ingress-tls")
++	assert.ElementsMatch(t, []string{"www.example.com"}, certificate.Spec.DNSNames)
++
++	// Pods become unready: the stale DNS endpoint is withdrawn, the certificate is untouched.
++	ipv4Slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	ipv6Slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	require.Nil(t, ctrlClient.Update(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Update(ctx, &ipv6Slice))
++	reconcileWithClient(ctx, t, ctrlClient, ingress, config)
++	assertDNSEndpointNotFound(t, ctx, ctrlClient, ingress)
++	getCertificate(t, ctx, ctrlClient, namespace, "my-ingress-tls")
++
++	// Ready addresses reappear: the DNS endpoint is restored automatically.
++	ipv4Slice.Endpoints[0].Conditions.Ready = boolPtr(true)
++	ipv6Slice.Endpoints[0].Conditions.Ready = boolPtr(true)
++	require.Nil(t, ctrlClient.Update(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Update(ctx, &ipv6Slice))
++	reconcileWithClient(ctx, t, ctrlClient, ingress, config)
++	dnsEndpoint = getDNSEndpoint(t, ctx, ctrlClient, ingress)
++	targets = dnsTargetsByRecord(dnsEndpoint)
++	assert.ElementsMatch(t, []string{"10.0.1.1", "10.0.1.2"}, targets["A"])
++	assert.ElementsMatch(t, []string{"2001:db8::1"}, targets["AAAA"])
++
++	// Slice deletion withdraws the affected addresses.
++	require.Nil(t, ctrlClient.Delete(ctx, &ipv6Slice))
++	reconcileWithClient(ctx, t, ctrlClient, ingress, config)
++	dnsEndpoint = getDNSEndpoint(t, ctx, ctrlClient, ingress)
++	targets = dnsTargetsByRecord(dnsEndpoint)
++	assert.ElementsMatch(t, []string{"10.0.1.1", "10.0.1.2"}, targets["A"])
++	assert.NotContains(t, targets, "AAAA")
++
++	// Switching the service from headless to a regular (dual-stack) address source publishes
++	// the cluster IPs instead of endpoint slice addresses.
++	var updated v1.Service
++	require.Nil(t, ctrlClient.Get(ctx,
++		types.NamespacedName{Name: service.Name, Namespace: namespace}, &updated))
++	updated.Spec.ClusterIP = "10.96.0.1"
++	updated.Spec.ClusterIPs = []string{"10.96.0.1", "2001:db8::96"}
++	require.Nil(t, ctrlClient.Update(ctx, &updated))
++	reconcileWithClient(ctx, t, ctrlClient, ingress, config)
++	dnsEndpoint = getDNSEndpoint(t, ctx, ctrlClient, ingress)
++	targets = dnsTargetsByRecord(dnsEndpoint)
++	assert.ElementsMatch(t, []string{"10.96.0.1"}, targets["A"])
++	assert.ElementsMatch(t, []string{"2001:db8::96"}, targets["AAAA"])
++}
++
++func TestReconcileDualStackNormalService(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	const namespace = "ns"
++
++	service := v1.Service{
++		ObjectMeta: metav1.ObjectMeta{Name: "traefik", Namespace: namespace},
++		Spec: v1.ServiceSpec{
++			ClusterIP:  "10.96.0.10",
++			ClusterIPs: []string{"10.96.0.10", "2001:db8::10"},
++			Ports:      []v1.ServicePort{{Port: 80, Name: "http"}},
++		},
++	}
++	ingress := headlessIngressRoute("my-ingress", namespace)
++	// Even if slices exist, a non-headless service keeps sourcing targets from its cluster IP.
++	slice := endpointSlice("traefik-v4", namespace, service.Name,
++		discoveryv1.AddressTypeIPv4, true, "10.0.1.1")
++
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
++		&service, &ingress, &slice,
++	).Build()
++	config := createConfig(&service)
++	reconcileWithClient(ctx, t, ctrlClient, ingress, config)
++
++	dnsEndpoint := getDNSEndpoint(t, ctx, ctrlClient, ingress)
++	targets := dnsTargetsByRecord(dnsEndpoint)
++	assert.ElementsMatch(t, []string{"10.96.0.10"}, targets["A"])
++	assert.ElementsMatch(t, []string{"2001:db8::10"}, targets["AAAA"])
++}
++
++//-------------------------------------------------------------------------------------------------
++// HELPERS
++//-------------------------------------------------------------------------------------------------
++
++func getDNSEndpoint(
++	t *testing.T, ctx context.Context, ctrlClient client.Client, ingress traefik.IngressRoute,
++) externaldnsv1alpha1.DNSEndpoint {
++	var dnsEndpoint externaldnsv1alpha1.DNSEndpoint
++	err := ctrlClient.Get(ctx,
++		types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace}, &dnsEndpoint)
++	require.Nil(t, err)
++	return dnsEndpoint
++}
++
++func assertDNSEndpointNotFound(
++	t *testing.T, ctx context.Context, ctrlClient client.Client, ingress traefik.IngressRoute,
++) {
++	var dnsEndpoint externaldnsv1alpha1.DNSEndpoint
++	err := ctrlClient.Get(ctx,
++		types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace}, &dnsEndpoint)
++	assert.True(t, apierrors.IsNotFound(err))
++}
++
++func getCertificate(
++	t *testing.T, ctx context.Context, ctrlClient client.Client, namespace, name string,
++) certmanager.Certificate {
++	var certificate certmanager.Certificate
++	err := ctrlClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &certificate)
++	require.Nil(t, err)
++	return certificate
++}
++
++func dnsTargetsByRecord(endpoint externaldnsv1alpha1.DNSEndpoint) map[string][]string {
++	result := make(map[string][]string)
++	for _, record := range endpoint.Spec.Endpoints {
++		result[record.RecordType] = append(result[record.RecordType], record.Targets...)
++	}
++	return result
++}
+diff --git a/internal/controllers/utils.go b/internal/controllers/utils.go
+index d53288e..a0d7d9d 100644
+--- a/internal/controllers/utils.go
++++ b/internal/controllers/utils.go
+@@ -1,6 +1,7 @@
+ package controllers
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"log/slog"
+ 
+@@ -10,9 +11,11 @@ import (
+ 	"github.com/borchero/switchboard/internal/k8s"
+ 	"github.com/borchero/switchboard/internal/switchboard"
+ 	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	discoveryv1 "k8s.io/api/discovery/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/builder"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/handler"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ )
+ 
+ func integrationsFromConfig(
+@@ -62,9 +65,9 @@ func builderWithIntegrations(
+ 
+ 	// Watch for dependent resources if required
+ 	for _, itg := range integrations {
+-		if itg.WatchedObject() != nil {
++		for _, watched := range itg.WatchedObjects() {
+ 			var list traefik.IngressRouteList
+-			enqueue := k8s.EnqueueMapFunc(ctrlClient, logger, itg.WatchedObject(), &list,
++			enqueue := watchEnqueueFunc(ctrlClient, logger, watched, &list,
+ 				func(list *traefik.IngressRouteList) []client.Object {
+ 					return ext.Map(list.Items, func(v traefik.IngressRoute) client.Object {
+ 						return &v
+@@ -72,7 +75,7 @@ func builderWithIntegrations(
+ 				},
+ 			)
+ 			builder = builder.Watches(
+-				itg.WatchedObject(),
++				watched,
+ 				handler.EnqueueRequestsFromMapFunc(enqueue),
+ 			)
+ 		}
+@@ -80,3 +83,36 @@ func builderWithIntegrations(
+ 
+ 	return builder
+ }
++
++// watchEnqueueFunc builds the mapping function for a watched object. Endpoint slices are matched
++// by namespace and the `kubernetes.io/service-name` label (their generated names are not known
++// upfront and a service may own multiple slices). All other watched objects are matched by their
++// exact name and namespace.
++func watchEnqueueFunc[L client.ObjectList](
++	ctrlClient client.Client,
++	logger *slog.Logger,
++	watched client.Object,
++	list L,
++	getItems func(L) []client.Object,
++) func(ctx context.Context, obj client.Object) []reconcile.Request {
++	if slice, ok := watched.(*discoveryv1.EndpointSlice); ok {
++		labels := slice.GetLabels()
++		namespace := slice.GetNamespace()
++		return k8s.EnqueueMapFuncMatching(
++			ctrlClient, logger,
++			func(obj client.Object) bool {
++				if obj.GetNamespace() != namespace {
++					return false
++				}
++				for key, value := range labels {
++					if obj.GetLabels()[key] != value {
++						return false
++					}
++				}
++				return true
++			},
++			list, getItems,
++		)
++	}
++	return k8s.EnqueueMapFunc(ctrlClient, logger, watched, list, getItems)
++}
+diff --git a/internal/integrations/certmanager.go b/internal/integrations/certmanager.go
+index b4e52de..6ae700b 100644
+--- a/internal/integrations/certmanager.go
++++ b/internal/integrations/certmanager.go
+@@ -31,7 +31,7 @@ func (*certManager) OwnedResource() client.Object {
+ 	return &certmanager.Certificate{}
+ }
+ 
+-func (*certManager) WatchedObject() client.Object {
++func (*certManager) WatchedObjects() []client.Object {
+ 	return nil
+ }
+ 
+diff --git a/internal/integrations/externaldns.go b/internal/integrations/externaldns.go
+index f25468a..03a014a 100644
+--- a/internal/integrations/externaldns.go
++++ b/internal/integrations/externaldns.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/borchero/switchboard/internal/k8s"
+ 	"github.com/borchero/switchboard/internal/switchboard"
+ 	v1 "k8s.io/api/core/v1"
++	discoveryv1 "k8s.io/api/discovery/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+@@ -39,15 +40,31 @@ func (*externalDNS) OwnedResource() client.Object {
+ 	return &externaldnsv1alpha1.DNSEndpoint{}
+ }
+ 
+-func (e *externalDNS) WatchedObject() client.Object {
++func (e *externalDNS) WatchedObjects() []client.Object {
+ 	name := e.target.NamespacedName()
+ 	if name == nil {
+ 		return nil
+ 	}
+-	return &v1.Service{
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name:      name.Name,
+-			Namespace: name.Namespace,
++	return []client.Object{
++		// Reconcile on changes of the target service itself (e.g. load balancer status updates
++		// or when the service is switched between headless and a regular cluster IP service).
++		&v1.Service{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      name.Name,
++				Namespace: name.Namespace,
++			},
++		},
++		// Reconcile on changes of the endpoint slices of the target service: for headless
++		// services, the published DNS targets are aggregated from the ready slice addresses.
++		// Slices are matched by the `kubernetes.io/service-name` label (slice names are
++		// generated and not known upfront).
++		&discoveryv1.EndpointSlice{
++			ObjectMeta: metav1.ObjectMeta{
++				Namespace: name.Namespace,
++				Labels: map[string]string{
++					discoveryv1.LabelServiceName: name.Name,
++				},
++			},
+ 		},
+ 	}
+ }
+@@ -71,6 +88,17 @@ func (e *externalDNS) UpdateResource(
+ 		return fmt.Errorf("failed to query IP for DNS A record: %w", err)
+ 	}
+ 
++	// If there are no targets (e.g. a headless service has no ready endpoints), a stale DNS
++	// endpoint must not continue to be published. We delete it and rely on the watch on the
++	// target's endpoint slices to recreate it automatically once addresses become available.
++	if len(targets) == 0 {
++		dnsEndpoint := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
++		if err := k8s.DeleteIfFound(ctx, e.client, &dnsEndpoint); err != nil {
++			return fmt.Errorf("failed to delete DNS endpoint without targets: %w", err)
++		}
++		return nil
++	}
++
+ 	// Create the endpoint resource
+ 	resource := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
+ 	if _, err := controllerutil.CreateOrPatch(ctx, e.client, &resource, func() error {
+diff --git a/internal/integrations/externaldns_test.go b/internal/integrations/externaldns_test.go
+index 3ed9378..924deb3 100644
+--- a/internal/integrations/externaldns_test.go
++++ b/internal/integrations/externaldns_test.go
+@@ -8,16 +8,109 @@ import (
+ 	"github.com/borchero/switchboard/internal/switchboard"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
++	discoveryv1 "k8s.io/api/discovery/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ 	externaldnsv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
+ 	"sigs.k8s.io/external-dns/endpoint"
+ )
+ 
+-func TestExternalDNSWatchedObject(t *testing.T) {
++func boolPtr(value bool) *bool {
++	return &value
++}
++
++func TestExternalDNSWatchedObjects(t *testing.T) {
+ 	integration := NewExternalDNS(nil, switchboard.NewServiceTarget("my-name", "my-namespace"), nil)
+-	obj := integration.WatchedObject()
+-	assert.Equal(t, "my-name", obj.GetName())
+-	assert.Equal(t, "my-namespace", obj.GetNamespace())
++	objects := integration.WatchedObjects()
++	require.Len(t, objects, 2)
++
++	// The target service itself is watched by exact name/namespace.
++	var service *v1.Service
++	var slice *discoveryv1.EndpointSlice
++	for _, obj := range objects {
++		switch typed := obj.(type) {
++		case *v1.Service:
++			service = typed
++		case *discoveryv1.EndpointSlice:
++			slice = typed
++		}
++	}
++	require.NotNil(t, service)
++	assert.Equal(t, "my-name", service.GetName())
++	assert.Equal(t, "my-namespace", service.GetNamespace())
++
++	// The endpoint slices of the target service are watched in the same namespace via the
++	// `kubernetes.io/service-name` label (slice names are generated).
++	require.NotNil(t, slice)
++	assert.Equal(t, "my-namespace", slice.GetNamespace())
++	assert.Empty(t, slice.GetName())
++	assert.Equal(t, "my-name", slice.GetLabels()[discoveryv1.LabelServiceName])
++
++	// Static targets do not watch any resources.
++	static := NewExternalDNS(nil, switchboard.NewStaticTarget("127.0.0.1"), nil)
++	assert.Nil(t, static.WatchedObjects())
++}
++
++func TestExternalDNSHeadlessLifecycle(t *testing.T) {
++	// Uses a fake client to verify that DNS endpoints are withdrawn while a headless service has
++	// no ready endpoints and restored once addresses become available again.
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	const namespace = "ns"
++	const serviceName = "headless"
++
++	headless := v1.Service{
++		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
++		Spec: v1.ServiceSpec{
++			ClusterIP:  v1.ClusterIPNone,
++			ClusterIPs: []string{v1.ClusterIPNone},
++			Ports:      []v1.ServicePort{{Port: 80, Name: "http"}},
++		},
++	}
++	owner := v1.Service{
++		ObjectMeta: metav1.ObjectMeta{Name: "owner", Namespace: namespace},
++	}
++	ctrlClient := fake.NewClientBuilder().
++		WithScheme(scheme).WithObjects(&headless, &owner).Build()
++	integration := NewExternalDNS(ctrlClient,
++		switchboard.NewServiceTarget(serviceName, namespace), nil)
++
++	info := IngressInfo{Hosts: []string{"example.com"}}
++
++	// No ready endpoints: the stale endpoint must be withdrawn (and no error occurs).
++	require.Nil(t, integration.UpdateResource(ctx, &owner, info))
++	var endpoints externaldnsv1alpha1.DNSEndpointList
++	require.Nil(t, ctrlClient.List(ctx, &endpoints, client.InNamespace(namespace)))
++	assert.Len(t, endpoints.Items, 0)
++
++	// Once a ready slice address exists, the endpoint is published.
++	slice := discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "headless-v4",
++			Namespace: namespace,
++			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
++		},
++		AddressType: discoveryv1.AddressTypeIPv4,
++		Endpoints: []discoveryv1.Endpoint{{
++			Addresses:  []string{"10.0.1.1"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		}},
++	}
++	require.Nil(t, ctrlClient.Create(ctx, &slice))
++	require.Nil(t, integration.UpdateResource(ctx, &owner, info))
++	require.Nil(t, ctrlClient.List(ctx, &endpoints, client.InNamespace(namespace)))
++	require.Len(t, endpoints.Items, 1)
++	assert.ElementsMatch(t, []string{"10.0.1.1"}, endpoints.Items[0].Spec.Endpoints[0].Targets)
++
++	// Pod going unready withdraws the endpoint again.
++	slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	require.Nil(t, ctrlClient.Update(ctx, &slice))
++	require.Nil(t, integration.UpdateResource(ctx, &owner, info))
++	endpoints = externaldnsv1alpha1.DNSEndpointList{}
++	require.Nil(t, ctrlClient.List(ctx, &endpoints, client.InNamespace(namespace)))
++	assert.Len(t, endpoints.Items, 0)
+ }
+ 
+ func TestExternalDNSUpdateResource(t *testing.T) {
+diff --git a/internal/integrations/interface.go b/internal/integrations/interface.go
+index 1cdafca..e8730ba 100644
+--- a/internal/integrations/interface.go
++++ b/internal/integrations/interface.go
+@@ -29,11 +29,12 @@ type Integration interface {
+ 	// owns. The resource should be "empty", i.e. no fields should be set.
+ 	OwnedResource() client.Object
+ 
+-	// WatchedObject optionally returns a particular object whose changes require the
+-	// reconciliation of all resources that this integration is applied to. In contrast to
+-	// `OwnedResource`, this method returns a concrete object (i.e. its name and namespace must
+-	// set set). If the integration does not watch any resources, this method may return `nil`.
+-	WatchedObject() client.Object
++	// WatchedObjects optionally returns objects whose changes require the reconciliation of all
++	// resources that this integration is applied to. In contrast to `OwnedResource`, the
++	// returned objects are "concrete" (i.e. their name and namespace must be set for objects
++	// matched by name, and labels must be set for objects matched by labels). If the
++	// integration does not watch any resources, this method may return an empty slice.
++	WatchedObjects() []client.Object
+ 
+ 	// UpdateResource updates the resource that ought to be owned by the passed object. Updating
+ 	// may entail creating the resource, updating an existing resource, or deleting the resouce.
+diff --git a/internal/k8s/enqueue.go b/internal/k8s/enqueue.go
+index cf60dd5..0572caa 100644
+--- a/internal/k8s/enqueue.go
++++ b/internal/k8s/enqueue.go
+@@ -17,12 +17,32 @@ func EnqueueMapFunc[L client.ObjectList](
+ 	target client.Object,
+ 	list L,
+ 	getItems func(L) []client.Object,
++) func(context.Context, client.Object) []reconcile.Request {
++	return EnqueueMapFuncMatching(
++		ctrlClient, logger,
++		func(obj client.Object) bool {
++			return target.GetObjectKind() == obj.GetObjectKind() &&
++				target.GetNamespace() == obj.GetNamespace() &&
++				target.GetName() == obj.GetName()
++		},
++		list, getItems,
++	)
++}
++
++// EnqueueMapFuncMatching may be used to watch changes of objects that cannot be identified by a
++// unique name/namespace pair (e.g. objects associated via labels). Whenever an observed object
++// satisfies the provided predicate, all resources of the list type are enqueued for
++// reconciliation. The given logger is used to log errors in the background.
++func EnqueueMapFuncMatching[L client.ObjectList](
++	ctrlClient client.Client,
++	logger *slog.Logger,
++	matches func(client.Object) bool,
++	list L,
++	getItems func(L) []client.Object,
+ ) func(context.Context, client.Object) []reconcile.Request {
+ 	return func(ctx context.Context, obj client.Object) []reconcile.Request {
+ 		// Check whether we need to enqueue any objects
+-		if target.GetObjectKind() != obj.GetObjectKind() ||
+-			target.GetNamespace() != obj.GetNamespace() ||
+-			target.GetName() != obj.GetName() {
++		if !matches(obj) {
+ 			return nil
+ 		}
+ 
+diff --git a/internal/k8s/enqueue_test.go b/internal/k8s/enqueue_test.go
+index 2fe3c0b..684276a 100644
+--- a/internal/k8s/enqueue_test.go
++++ b/internal/k8s/enqueue_test.go
+@@ -10,7 +10,10 @@ import (
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	v1 "k8s.io/api/core/v1"
++	discoveryv1 "k8s.io/api/discovery/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+ 
+ func TestEnqueueMapFunc(t *testing.T) {
+@@ -57,3 +60,86 @@ func TestEnqueueMapFunc(t *testing.T) {
+ 	}
+ 	assert.ElementsMatch(t, names, found)
+ }
++
++func TestEnqueueMapFuncMatchingEndpointSlice(t *testing.T) {
++	// Uses a fake client (no live cluster required): endpoint slices are matched by namespace
++	// and the `kubernetes.io/service-name` label, mirroring how the ingress route controller
++	// reconciles upon slice creation, update (address/readiness), and deletion.
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	const namespace = "ns"
++	const serviceName = "headless"
++
++	configMap1 := v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "ingress-1", Namespace: namespace}}
++	configMap2 := v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "ingress-2", Namespace: "other-ns"}}
++	ctrlClient := fake.NewClientBuilder().
++		WithScheme(scheme).WithObjects(&configMap1, &configMap2).Build()
++
++	watched := &discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Namespace: namespace,
++			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
++		},
++	}
++	var configMaps v1.ConfigMapList
++	enqueuer := EnqueueMapFuncMatching(
++		ctrlClient, slog.Default(),
++		func(obj client.Object) bool {
++			if obj.GetNamespace() != watched.GetNamespace() {
++				return false
++			}
++			for key, value := range watched.GetLabels() {
++				if obj.GetLabels()[key] != value {
++					return false
++				}
++			}
++			return true
++		},
++		&configMaps,
++		func(list *v1.ConfigMapList) []client.Object {
++			return ext.Map(list.Items, func(v v1.ConfigMap) client.Object { return &v })
++		},
++	)
++
++	// Slice of the target service (regardless of its generated name) triggers reconciliation.
++	matchingSlice := discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "headless-abc123",
++			Namespace: namespace,
++			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
++		},
++	}
++	requests := enqueuer(ctx, &matchingSlice)
++	assert.Len(t, requests, 2)
++
++	// A readiness/address update event carries the same labels and enqueues as well.
++	matchingSlice.Endpoints = []discoveryv1.Endpoint{{
++		Addresses:  []string{"10.0.0.1"},
++		Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(false)},
++	}}
++	assert.Len(t, enqueuer(ctx, &matchingSlice), 2)
++
++	// A slice associated with another service does not trigger reconciliation.
++	otherSlice := discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "other-def456",
++			Namespace: namespace,
++			Labels:    map[string]string{discoveryv1.LabelServiceName: "other-service"},
++		},
++	}
++	assert.Len(t, enqueuer(ctx, &otherSlice), 0)
++
++	// A slice of the target service name in another namespace does not trigger either.
++	foreignSlice := discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "headless-xyz789",
++			Namespace: "other-ns",
++			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
++		},
++	}
++	assert.Len(t, enqueuer(ctx, &foreignSlice), 0)
++}
++
++func boolPtr(value bool) *bool {
++	return &value
++}
+diff --git a/internal/switchboard/targets.go b/internal/switchboard/targets.go
+index b7a6fe2..ee5cc68 100644
+--- a/internal/switchboard/targets.go
++++ b/internal/switchboard/targets.go
+@@ -3,9 +3,12 @@ package switchboard
+ import (
+ 	"context"
+ 	"fmt"
++	"net"
++	"sort"
+ 	"strings"
+ 
+ 	v1 "k8s.io/api/core/v1"
++	discoveryv1 "k8s.io/api/discovery/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+@@ -60,16 +63,106 @@ func NewServiceTarget(name, namespace string) Target {
+ 	}
+ }
+ 
+-func (t serviceTarget) Targets(ctx context.Context, client client.Client) ([]string, error) {
++func (t serviceTarget) Targets(ctx context.Context, ctrlClient client.Client) ([]string, error) {
+ 	// Get service
+ 	var service v1.Service
+-	if err := client.Get(ctx, t.name, &service); err != nil {
++	if err := ctrlClient.Get(ctx, t.name, &service); err != nil {
+ 		return nil, fmt.Errorf("failed to query service: %w", err)
+ 	}
+-	return t.targetsFromService(service), nil
++
++	// For headless services, the ClusterIP is the sentinel `None` which is not a routable
++	// address. Instead, we aggregate the ready addresses of the service's endpoint slices.
++	var headlessTargets []string
++	if isHeadlessService(&service) {
++		var slices discoveryv1.EndpointSliceList
++		if err := ctrlClient.List(ctx, &slices,
++			client.InNamespace(service.Namespace),
++			client.MatchingLabels{discoveryv1.LabelServiceName: service.Name},
++		); err != nil {
++			return nil, fmt.Errorf("failed to list endpoint slices for service %q: %w",
++				t.name.String(), err)
++		}
++		headlessTargets = ReadyAddressesFromEndpointSlices(service.Name, slices.Items)
++	}
++	return t.targetsFromService(service, headlessTargets), nil
++}
++
++// isHeadlessService reports whether the given service is headless, i.e. it does not get a
++// cluster IP assigned. Kubernetes represents the absence of a cluster IP using the sentinel
++// value `None`.
++func isHeadlessService(service *v1.Service) bool {
++	if service.Spec.ClusterIP == v1.ClusterIPNone {
++		return true
++	}
++	for _, ip := range service.Spec.ClusterIPs {
++		if ip == v1.ClusterIPNone {
++			return true
++		}
++	}
++	return false
+ }
+ 
+-func (serviceTarget) targetsFromService(service v1.Service) []string {
++// ReadyAddressesFromEndpointSlices aggregates the unique, ready IPv4/IPv6 addresses exposed by
++// the endpoint slices that belong to the provided service. Addresses of endpoints that are not
++// ready, that are terminating, that are not valid IPs, or that are served by endpoint slices of
++// another service are skipped. The returned addresses are sorted to yield stable results.
++func ReadyAddressesFromEndpointSlices(
++	serviceName string, slices []discoveryv1.EndpointSlice,
++) []string {
++	targets := make([]string, 0)
++	seen := make(map[string]struct{})
++	for _, slice := range slices {
++		// Only accept slices that belong to the target service. Although callers typically
++		// already filter by the `kubernetes.io/service-name` label, we re-check defensively to
++		// ensure endpoints of other services never leak into the result.
++		if slice.Labels[discoveryv1.LabelServiceName] != serviceName {
++			continue
++		}
++		if slice.AddressType != discoveryv1.AddressTypeIPv4 &&
++			slice.AddressType != discoveryv1.AddressTypeIPv6 {
++			continue
++		}
++		for _, endpoint := range slice.Endpoints {
++			if !isReadyEndpoint(&endpoint) {
++				continue
++			}
++			for _, address := range endpoint.Addresses {
++				if address == "" || net.ParseIP(address) == nil {
++					continue
++				}
++				if _, ok := seen[address]; ok {
++					continue
++				}
++				seen[address] = struct{}{}
++				targets = append(targets, address)
++			}
++		}
++	}
++	sort.Strings(targets)
++	return targets
++}
++
++// isReadyEndpoint reports whether the given endpoint slice endpoint may serve traffic: its ready
++// condition must explicitly be `true` and it must not be terminating.
++func isReadyEndpoint(endpoint *discoveryv1.Endpoint) bool {
++	if endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready {
++		return false
++	}
++	if endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating {
++		return false
++	}
++	return true
++}
++
++// targetsFromService resolves the DNS targets of a service using the documented precedence:
++//  1. hostnames set via the `external-dns.alpha.kubernetes.io/hostname` annotation,
++//  2. hostnames/IPs reported via the load balancer ingress status,
++//  3. the ready endpoint addresses for headless services (which may be empty, signaling that
++//     stale DNS records must be withdrawn),
++//  4. the service's cluster IPs.
++func (serviceTarget) targetsFromService(
++	service v1.Service, headlessTargets []string,
++) []string {
+ 	targets := make([]string, 0)
+ 
+ 	// Prioritize annotation hostnames.
+@@ -94,9 +187,16 @@ func (serviceTarget) targetsFromService(service v1.Service) []string {
+ 		}
+ 	}
+ 
+-	// ...fall back to cluster IPs
+ 	if len(targets) == 0 {
+-		targets = append(targets, service.Spec.ClusterIPs...)
++		if isHeadlessService(&service) {
++			// For headless services, the cluster IP is the `None` sentinel and must never be
++			// published. An empty slice is intentional: it causes the DNSEndpoint to be removed
++			// until ready endpoints become available again.
++			targets = append(targets, headlessTargets...)
++		} else {
++			// ...fall back to cluster IPs
++			targets = append(targets, service.Spec.ClusterIPs...)
++		}
+ 	}
+ 	return targets
+ }
+diff --git a/internal/switchboard/targets_test.go b/internal/switchboard/targets_test.go
+index 239fa34..2e97790 100644
+--- a/internal/switchboard/targets_test.go
++++ b/internal/switchboard/targets_test.go
+@@ -9,7 +9,10 @@ import (
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	v1 "k8s.io/api/core/v1"
++	discoveryv1 "k8s.io/api/discovery/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+ )
+ 
+ func TestServiceTargetTargets(t *testing.T) {
+@@ -46,6 +49,78 @@ func TestServiceTargetTargets(t *testing.T) {
+ 	assert.ElementsMatch(t, []string{service.Status.LoadBalancer.Ingress[0].IP}, targets)
+ }
+ 
++func TestServiceTargetTargetsHeadlessLive(t *testing.T) {
++	// Live-cluster test: a headless service (without selector, so that the endpoint slice
++	// controller does not manage slices for it) sources its targets from manually managed
++	// endpoint slices and withdraws them while none of the endpoints is ready.
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	ctrlClient := k8tests.NewClient(t, scheme)
++	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
++	defer shutdown()
++
++	service := v1.Service{
++		ObjectMeta: metav1.ObjectMeta{Name: "my-headless", Namespace: namespace},
++		Spec: v1.ServiceSpec{
++			ClusterIP:  v1.ClusterIPNone,
++			ClusterIPs: []string{v1.ClusterIPNone},
++			Ports:      []v1.ServicePort{{Port: 80, Name: "http"}},
++		},
++	}
++	require.Nil(t, ctrlClient.Create(ctx, &service))
++
++	target := NewServiceTarget(service.Name, service.Namespace)
++
++	// No slices yet: no targets may be published.
++	targets, err := target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Len(t, targets, 0)
++
++	// Ready dual-stack slices result in aggregated, deduplicated addresses.
++	ipv4Slice := dummyEndpointSlice("my-headless-v4", namespace, service.Name,
++		discoveryv1.AddressTypeIPv4,
++		discoveryv1.Endpoint{
++			Addresses:  []string{"10.0.1.1"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		})
++	ipv6Slice := dummyEndpointSlice("my-headless-v6", namespace, service.Name,
++		discoveryv1.AddressTypeIPv6,
++		discoveryv1.Endpoint{
++			Addresses:  []string{"2001:db8::1"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		})
++	require.Nil(t, ctrlClient.Create(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Create(ctx, &ipv6Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.ElementsMatch(t, []string{"10.0.1.1", "2001:db8::1"}, targets)
++
++	// Endpoint becoming unready withdraws the stale addresses.
++	ipv4Slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	ipv6Slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	require.Nil(t, ctrlClient.Update(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Update(ctx, &ipv6Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Len(t, targets, 0)
++
++	// Ready again: addresses are restored.
++	ipv4Slice.Endpoints[0].Conditions.Ready = boolPtr(true)
++	ipv6Slice.Endpoints[0].Conditions.Ready = boolPtr(true)
++	require.Nil(t, ctrlClient.Update(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Update(ctx, &ipv6Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.ElementsMatch(t, []string{"10.0.1.1", "2001:db8::1"}, targets)
++
++	// Slice deletion removes the corresponding addresses.
++	require.Nil(t, ctrlClient.Delete(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Delete(ctx, &ipv6Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Len(t, targets, 0)
++}
++
+ func TestServiceTargetTargetsFromService(t *testing.T) {
+ 	var target serviceTarget
+ 
+@@ -54,26 +129,26 @@ func TestServiceTargetTargetsFromService(t *testing.T) {
+ 	}
+ 
+ 	// Source cluster IP
+-	targets := target.targetsFromService(service)
++	targets := target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, service.Spec.ClusterIPs, targets)
+ 
+ 	// Source multiple cluster IPs
+ 	service.Spec.ClusterIPs = []string{"10.0.0.5", "2001:db8::1"}
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, service.Spec.ClusterIPs, targets)
+ 
+ 	// Source IP from status
+ 	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{
+ 		IP: "192.168.5.5",
+ 	}}
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"192.168.5.5"}, targets)
+ 
+ 	// Source hostname from status
+ 	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{
+ 		Hostname: "example.lb.identifier.amazonaws.com",
+ 	}}
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"example.lb.identifier.amazonaws.com"}, targets)
+ 
+ 	// Ensure hostname takes precedence
+@@ -81,7 +156,7 @@ func TestServiceTargetTargetsFromService(t *testing.T) {
+ 		IP:       "192.168.5.5",
+ 		Hostname: "example.lb.identifier.amazonaws.com",
+ 	}}
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"example.lb.identifier.amazonaws.com"}, targets)
+ 
+ 	// Ensure only one hostname
+@@ -90,14 +165,14 @@ func TestServiceTargetTargetsFromService(t *testing.T) {
+ 	}, {
+ 		Hostname: "example2.lb.identifier.amazonaws.com",
+ 	}}
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"example.lb.identifier.amazonaws.com"}, targets)
+ 
+ 	// Source hostname from annotation
+ 	service.SetAnnotations(map[string]string{
+ 		HostnameKey: "example.identifier.amazonaws.com",
+ 	})
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"example.identifier.amazonaws.com"}, targets)
+ 
+ 	// Ensure annotation takes precedence
+@@ -108,15 +183,259 @@ func TestServiceTargetTargetsFromService(t *testing.T) {
+ 		IP:       "192.168.5.5",
+ 		Hostname: "example.lb.identifier.amazonaws.com",
+ 	}}
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"example.identifier.amazonaws.com"}, targets)
+ 
+ 	// Ensure only one hostname
+ 	service.SetAnnotations(map[string]string{
+ 		HostnameKey: "example.identifier.amazonaws.com, example2.identifier.amazonaws.com",
+ 	})
+-	targets = target.targetsFromService(service)
++	targets = target.targetsFromService(service, nil)
+ 	assert.ElementsMatch(t, []string{"example.identifier.amazonaws.com"}, targets)
++
++	// Headless services must never publish the `None` cluster IP: ready endpoint addresses are
++	// used instead.
++	headless := v1.Service{
++		Spec: v1.ServiceSpec{
++			ClusterIP:  v1.ClusterIPNone,
++			ClusterIPs: []string{v1.ClusterIPNone},
++		},
++	}
++	targets = target.targetsFromService(headless, []string{"10.0.0.10", "2001:db8::10"})
++	assert.ElementsMatch(t, []string{"10.0.0.10", "2001:db8::10"}, targets)
++
++	// No ready endpoints for a headless service results in no targets (DNS records withdrawn).
++	targets = target.targetsFromService(headless, nil)
++	assert.Len(t, targets, 0)
++
++	// Annotation hostnames take precedence over headless endpoint addresses.
++	headless.Annotations = map[string]string{HostnameKey: "example.identifier.amazonaws.com"}
++	targets = target.targetsFromService(headless, []string{"10.0.0.10"})
++	assert.ElementsMatch(t, []string{"example.identifier.amazonaws.com"}, targets)
++	headless.Annotations = nil
++
++	// Load balancer hostnames/IPs take precedence over headless endpoint addresses.
++	headless.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "192.168.5.5"}}
++	targets = target.targetsFromService(headless, []string{"10.0.0.10"})
++	assert.ElementsMatch(t, []string{"192.168.5.5"}, targets)
++}
++
++func boolPtr(value bool) *bool {
++	return &value
++}
++
++func dummyEndpointSlice(
++	name, namespace, serviceName string, addressType discoveryv1.AddressType,
++	endpoints ...discoveryv1.Endpoint,
++) discoveryv1.EndpointSlice {
++	return discoveryv1.EndpointSlice{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			Labels:    map[string]string{discoveryv1.LabelServiceName: serviceName},
++		},
++		AddressType: addressType,
++		Endpoints:   endpoints,
++	}
++}
++
++func TestReadyAddressesFromEndpointSlices(t *testing.T) {
++	const serviceName = "my-service"
++
++	ready := func(addresses ...string) discoveryv1.Endpoint {
++		return discoveryv1.Endpoint{
++			Addresses:  addresses,
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		}
++	}
++
++	// Ready IPv4 and IPv6 endpoints across multiple slices are aggregated and sorted.
++	slices := []discoveryv1.EndpointSlice{
++		dummyEndpointSlice("slice-v4", "ns", serviceName, discoveryv1.AddressTypeIPv4,
++			ready("10.0.0.2"), ready("10.0.0.1")),
++		dummyEndpointSlice("slice-v6", "ns", serviceName, discoveryv1.AddressTypeIPv6,
++			ready("2001:db8::2")),
++	}
++	targets := ReadyAddressesFromEndpointSlices(serviceName, slices)
++	assert.Equal(t, []string{"10.0.0.1", "10.0.0.2", "2001:db8::2"}, targets)
++
++	// Duplicate addresses (e.g. across slices) are deduplicated.
++	slices = append(slices, dummyEndpointSlice("slice-dup", "ns", serviceName,
++		discoveryv1.AddressTypeIPv4, ready("10.0.0.1", "10.0.0.3")))
++	targets = ReadyAddressesFromEndpointSlices(serviceName, slices)
++	assert.Equal(t,
++		[]string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "2001:db8::2"}, targets)
++
++	// Not-ready endpoints (ready false or nil) are skipped.
++	slices = []discoveryv1.EndpointSlice{
++		dummyEndpointSlice("slice-not-ready", "ns", serviceName, discoveryv1.AddressTypeIPv4,
++			discoveryv1.Endpoint{
++				Addresses:  []string{"10.0.0.4"},
++				Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(false)},
++			},
++			discoveryv1.Endpoint{
++				Addresses:  []string{"10.0.0.5"},
++				Conditions: discoveryv1.EndpointConditions{Ready: nil},
++			},
++			ready("10.0.0.6"),
++		),
++	}
++	targets = ReadyAddressesFromEndpointSlices(serviceName, slices)
++	assert.Equal(t, []string{"10.0.0.6"}, targets)
++
++	// Terminating endpoints are skipped even if their ready condition is still true.
++	slices = []discoveryv1.EndpointSlice{
++		dummyEndpointSlice("slice-terminating", "ns", serviceName, discoveryv1.AddressTypeIPv4,
++			discoveryv1.Endpoint{
++				Addresses:  []string{"10.0.0.7"},
++				Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true), Terminating: boolPtr(true)},
++			},
++			ready("10.0.0.8"),
++		),
++	}
++	targets = ReadyAddressesFromEndpointSlices(serviceName, slices)
++	assert.Equal(t, []string{"10.0.0.8"}, targets)
++
++	// Slices belonging to another service are ignored.
++	slices = []discoveryv1.EndpointSlice{
++		dummyEndpointSlice("slice-other", "ns", "other-service", discoveryv1.AddressTypeIPv4,
++			ready("10.0.0.9")),
++	}
++	targets = ReadyAddressesFromEndpointSlices(serviceName, slices)
++	assert.Len(t, targets, 0)
++
++	// Slices with a non-IP address type and invalid addresses are ignored.
++	slices = []discoveryv1.EndpointSlice{
++		dummyEndpointSlice("slice-fqdn", "ns", serviceName, discoveryv1.AddressTypeFQDN,
++			ready("pod.example.com")),
++		dummyEndpointSlice("slice-invalid", "ns", serviceName, discoveryv1.AddressTypeIPv4,
++			ready("not-an-ip", ""), ready("10.0.0.10")),
++	}
++	targets = ReadyAddressesFromEndpointSlices(serviceName, slices)
++	assert.Equal(t, []string{"10.0.0.10"}, targets)
++
++	// No slices at all yields no targets.
++	assert.Len(t, ReadyAddressesFromEndpointSlices(serviceName, nil), 0)
++}
++
++func TestServiceTargetTargetsHeadless(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	const namespace = "ns"
++	const serviceName = "headless"
++
++	headless := v1.Service{
++		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: namespace},
++		Spec: v1.ServiceSpec{
++			ClusterIP:  v1.ClusterIPNone,
++			ClusterIPs: []string{v1.ClusterIPNone},
++			Ports:      []v1.ServicePort{{Port: 80, Name: "http"}},
++		},
++	}
++
++	// A headless service without any endpoint slices has no publishable targets.
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&headless).Build()
++	target := NewServiceTarget(serviceName, namespace)
++	targets, err := target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Len(t, targets, 0)
++
++	// Ready IPv4 and IPv6 addresses of the service's slices are published.
++	ipv4Slice := dummyEndpointSlice("headless-v4", namespace, serviceName,
++		discoveryv1.AddressTypeIPv4,
++		discoveryv1.Endpoint{
++			Addresses:  []string{"10.0.1.1"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		})
++	ipv6Slice := dummyEndpointSlice("headless-v6", namespace, serviceName,
++		discoveryv1.AddressTypeIPv6,
++		discoveryv1.Endpoint{
++			Addresses:  []string{"2001:db8::1"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		})
++	otherSlice := dummyEndpointSlice("other-v4", namespace, "other-service",
++		discoveryv1.AddressTypeIPv4,
++		discoveryv1.Endpoint{
++			Addresses:  []string{"10.0.9.9"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		})
++	require.Nil(t, ctrlClient.Create(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Create(ctx, &ipv6Slice))
++	require.Nil(t, ctrlClient.Create(ctx, &otherSlice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Equal(t, []string{"10.0.1.1", "2001:db8::1"}, targets)
++
++	// When the only endpoints become not ready, no addresses remain.
++	ipv4Slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	ipv6Slice.Endpoints[0].Conditions.Ready = boolPtr(false)
++	require.Nil(t, ctrlClient.Update(ctx, &ipv4Slice))
++	require.Nil(t, ctrlClient.Update(ctx, &ipv6Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Len(t, targets, 0)
++
++	// Newly available addresses are picked up automatically.
++	ipv4Slice.Endpoints[0].Conditions.Ready = boolPtr(true)
++	ipv4Slice.Endpoints = append(ipv4Slice.Endpoints, discoveryv1.Endpoint{
++		Addresses:  []string{"10.0.1.2"},
++		Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++	})
++	require.Nil(t, ctrlClient.Update(ctx, &ipv4Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Equal(t, []string{"10.0.1.1", "10.0.1.2"}, targets)
++
++	// Slice deletion no longer publishes the removed addresses.
++	require.Nil(t, ctrlClient.Delete(ctx, &ipv4Slice))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Len(t, targets, 0)
++
++	// Switching the service back to a regular address source falls back to the cluster IP.
++	var updated v1.Service
++	require.Nil(t, ctrlClient.Get(ctx,
++		client.ObjectKey{Name: serviceName, Namespace: namespace}, &updated))
++	updated.Spec.ClusterIP = "10.96.0.1"
++	updated.Spec.ClusterIPs = []string{"10.96.0.1"}
++	require.Nil(t, ctrlClient.Update(ctx, &updated))
++	targets, err = target.Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Equal(t, []string{"10.96.0.1"}, targets)
++}
++
++func TestServiceTargetTargetsHeadlessPrecedence(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	const namespace = "ns"
++	const serviceName = "headless"
++
++	headless := v1.Service{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      serviceName,
++			Namespace: namespace,
++			Annotations: map[string]string{
++				HostnameKey: "example.identifier.amazonaws.com",
++			},
++		},
++		Spec: v1.ServiceSpec{
++			ClusterIP:  v1.ClusterIPNone,
++			ClusterIPs: []string{v1.ClusterIPNone},
++			Ports:      []v1.ServicePort{{Port: 80, Name: "http"}},
++		},
++	}
++	slice := dummyEndpointSlice("headless-v4", namespace, serviceName,
++		discoveryv1.AddressTypeIPv4,
++		discoveryv1.Endpoint{
++			Addresses:  []string{"10.0.1.1"},
++			Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
++		})
++	ctrlClient := fake.NewClientBuilder().
++		WithScheme(scheme).WithObjects(&headless, &slice).Build()
++
++	targets, err := NewServiceTarget(serviceName, namespace).Targets(ctx, ctrlClient)
++	require.Nil(t, err)
++	assert.Equal(t, []string{"example.identifier.amazonaws.com"}, targets)
+ }
+ 
+ func TestServiceTargetNamespacedName(t *testing.T) {
