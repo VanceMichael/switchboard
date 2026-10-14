@@ -13,6 +13,10 @@ rules:
   - apiGroups: ["traefik.io"]
     resources: ["ingressroutes"]
     verbs: ["get", "list", "watch"]
+  # Required to watch namespace labels when `selector.namespaceSelector` is configured
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
   # Integrations
   {{ if .Values.integrations.certManager.enabled }}
   - apiGroups: ["cert-manager.io"]

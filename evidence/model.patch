@@ -1,0 +1,1245 @@
+diff --git a/README.md b/README.md
+index 6ae4c19..9f06dc7 100644
+--- a/README.md
++++ b/README.md
+@@ -165,6 +165,36 @@ By setting the `ignore` annotation to `all` (or `true`), Switchboard does not pr
+ more fine-grained control, the value of this annotation can also be set to a comma-separated list of integrations
+ (possible values `cert-manager`, `external-dns`).
+ 
++#### Restrict Processing to Selected Namespaces
++
++By default, Switchboard operates cluster-wide and processes all `IngressRoute` objects (subject to the ingress class
++and ignore rules above). Cluster operators can additionally restrict automation to namespaces matching a label
++selector by setting `selector.namespaceSelector` in the configuration (or `selector.namespaceSelector` in the Helm
++values). Both `matchLabels` and `matchExpressions` are supported. An invalid selector causes Switchboard to fail at
++startup.
++
++```yaml
++# Helm values
++selector:
++  namespaceSelector:
++    matchLabels:
++      switchboard.borchero.com/ingress: enabled
++```
++
++The selector is re-evaluated on every reconciliation, so flipping namespace labels takes effect without touching
++individual ingress routes:
++
++- When a namespace starts matching, Switchboard creates or repairs the `Certificate` and `DNSEndpoint` of all
++  qualifying ingress routes in the namespace.
++- When a namespace stops matching, only the two kinds of derived resources that are owned by the respective ingress
++  route are removed. Same-named resources created by someone else are never touched.
++- When the namespace labels match again, the derived resources are re-created automatically.
++
++If reading namespace state temporarily fails (e.g. during an API server disruption), membership is considered
++unknown: existing derived resources are kept and the reconciliation is retried, converging against the actual labels
++once the API is available again. Changes of the configured target service likewise only trigger updates of routes
++that are currently taken over.
++
+ ## License
+ 
+ Switchboard is licensed under the [MIT License](./LICENSE).
+diff --git a/chart/README.md b/chart/README.md
+index d7c7975..2af90ea 100644
+--- a/chart/README.md
++++ b/chart/README.md
+@@ -71,4 +71,5 @@ The following lists all values that may be set when installing this chart (see
+ | replicas | int | `1` | The number of manager replicas to use. |
+ | resources | object | `{}` | The resources to use for the operator. |
+ | selector.ingressClass | string | `nil` | When set, Switchboard only processes ingress routes with the `kubernetes.io/ingress.class`    annotation set to this value. |
++| selector.namespaceSelector | object | `nil` | When set, Switchboard only takes over ingress routes in namespaces whose labels match this    label selector (supports `matchLabels` and `matchExpressions`). When a namespace starts    matching, the Certificate and DNSEndpoint resources are created or repaired; when it stops    matching, only the resources owned by Switchboard are removed and re-created once the    namespace matches again. Unset means Switchboard operates cluster-wide. |
+ | tolerations | list | `[]` |  |
+diff --git a/chart/templates/_config.tpl b/chart/templates/_config.tpl
+index 1c0dbd1..f110cd1 100644
+--- a/chart/templates/_config.tpl
++++ b/chart/templates/_config.tpl
+@@ -12,10 +12,16 @@ metrics:
+   bindAddress: :{{ .Values.metrics.port }}
+ {{ end }}
+ 
+-{{ if .Values.selector.ingressClass }}
++{{- if or .Values.selector.ingressClass .Values.selector.namespaceSelector }}
+ selector:
++  {{- if .Values.selector.ingressClass }}
+   ingressClass: {{ .Values.selector.ingressClass }}
+-{{ end }}
++  {{- end }}
++  {{- with .Values.selector.namespaceSelector }}
++  namespaceSelector:
++    {{ toYaml . | nindent 4 }}
++  {{- end }}
++{{- end }}
+ 
+ {{- $certManager := .Values.integrations.certManager -}}
+ {{- $externalDNS := .Values.integrations.externalDNS -}}
+diff --git a/chart/templates/rbac.yaml b/chart/templates/rbac.yaml
+index 69ef4f7..17d7bf6 100644
+--- a/chart/templates/rbac.yaml
++++ b/chart/templates/rbac.yaml
+@@ -13,6 +13,10 @@ rules:
+   - apiGroups: ["traefik.io"]
+     resources: ["ingressroutes"]
+     verbs: ["get", "list", "watch"]
++  # Required to watch namespace labels when `selector.namespaceSelector` is configured
++  - apiGroups: [""]
++    resources: ["namespaces"]
++    verbs: ["get", "list", "watch"]
+   # Integrations
+   {{ if .Values.integrations.certManager.enabled }}
+   - apiGroups: ["cert-manager.io"]
+diff --git a/chart/values.yaml b/chart/values.yaml
+index 5c25b40..1727151 100644
+--- a/chart/values.yaml
++++ b/chart/values.yaml
+@@ -34,6 +34,12 @@ selector:
+   # -- When set, Switchboard only processes ingress routes with the `kubernetes.io/ingress.class`
+   #    annotation set to this value.
+   ingressClass: ~
++  # -- When set, Switchboard only takes over ingress routes in namespaces whose labels match this
++  #    label selector (supports `matchLabels` and `matchExpressions`). When a namespace starts
++  #    matching, the Certificate and DNSEndpoint resources are created or repaired; when it stops
++  #    matching, only the resources owned by Switchboard are removed and re-created once the
++  #    namespace matches again. Unset means Switchboard operates cluster-wide.
++  namespaceSelector: ~
+ 
+ integrations:
+   certManager:
+diff --git a/internal/config/v1/config.go b/internal/config/v1/config.go
+index aae86c1..b323651 100644
+--- a/internal/config/v1/config.go
++++ b/internal/config/v1/config.go
+@@ -2,6 +2,7 @@ package v1
+ 
+ import (
+ 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+ // Config is the Schema for the configs API
+@@ -39,9 +40,14 @@ type MetricsConfig struct {
+ 
+ //-------------------------------------------------------------------------------------------------
+ 
+-// IngressSelector can be used to limit operations to ingresses with a specific class.
++// IngressSelector can be used to limit operations to ingresses with a specific class and/or to
++// ingresses located in namespaces matching a label selector.
+ type IngressSelector struct {
+ 	IngressClass *string `json:"ingressClass,omitempty"`
++	// NamespaceSelector optionally restricts which namespaces Switchboard takes over ingress
++	// routes in. When unset, Switchboard operates cluster-wide. An invalid selector causes
++	// startup to fail.
++	NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
+ }
+ 
+ // IntegrationConfigs describes the configurations for all integrations.
+diff --git a/internal/controllers/ingressroute.go b/internal/controllers/ingressroute.go
+index 565b055..274d703 100644
+--- a/internal/controllers/ingressroute.go
++++ b/internal/controllers/ingressroute.go
+@@ -10,9 +10,16 @@ import (
+ 	"github.com/borchero/switchboard/internal/integrations"
+ 	"github.com/borchero/switchboard/internal/switchboard"
+ 	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	v1 "k8s.io/api/core/v1"
+ 	apierrs "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++	"k8s.io/apimachinery/pkg/types"
+ 	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/builder"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/handler"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
+ )
+ 
+ // IngressRouteReconciler reconciles an IngressRoute object.
+@@ -31,10 +38,22 @@ func NewIngressRouteReconciler(
+ 	if err != nil {
+ 		return IngressRouteReconciler{}, fmt.Errorf("failed to initialize integrations: %s", err)
+ 	}
++
++	// Parse the optional namespace selector up-front: an invalid selector must cause startup to
++	// fail rather than being discovered on every reconcile.
++	var namespaceSelector labels.Selector
++	if config.Selector.NamespaceSelector != nil {
++		namespaceSelector, err = metav1.LabelSelectorAsSelector(config.Selector.NamespaceSelector)
++		if err != nil {
++			return IngressRouteReconciler{},
++				fmt.Errorf("invalid namespace label selector: %w", err)
++		}
++	}
++
+ 	return IngressRouteReconciler{
+ 		Client:       client,
+ 		logger:       logger,
+-		selector:     switchboard.NewSelector(config.Selector.IngressClass),
++		selector:     switchboard.NewSelector(config.Selector.IngressClass, namespaceSelector),
+ 		integrations: integrations,
+ 	}, nil
+ }
+@@ -56,6 +75,35 @@ func (r *IngressRouteReconciler) Reconcile(
+ 		return ctrl.Result{}, client.IgnoreNotFound(err)
+ 	}
+ 
++	// If a namespace selector is configured, determine whether the ingress route's namespace is
++	// in scope. Whenever the namespace cannot be read, membership is unknown: we keep all
++	// existing derived resources in place and return a retriable error so that the next attempt
++	// converges against the actual labels once the API is available again.
++	if r.selector.RestrictsNamespaces() {
++		var namespace v1.Namespace
++		if err := r.Get(
++			ctx, types.NamespacedName{Name: ingressRoute.Namespace}, &namespace,
++		); err != nil {
++			logger.Error("unable to query namespace; membership is unknown, retrying", "error", err)
++			return ctrl.Result{}, err
++		}
++		if !r.selector.MatchesNamespace(namespace.Labels) {
++			// The namespace explicitly left the scope. We release only the derived resources
++			// that are controlled by this ingress route: same-named resources created by
++			// someone else must not be affected.
++			logger.Debug("namespace does not match selector, releasing owned resources")
++			for _, itg := range r.integrations {
++				if err := itg.DeleteResource(ctx, &ingressRoute); err != nil {
++					logger.Error("failed to release owned resource",
++						"integration", itg.Name(), "error", err,
++					)
++					return ctrl.Result{}, err
++				}
++			}
++			return ctrl.Result{}, nil
++		}
++	}
++
+ 	// Then, we check if the resource should be processed
+ 	if !r.selector.Matches(ingressRoute.Annotations) {
+ 		logger.Debug("ignoring ingress route")
+@@ -101,7 +149,17 @@ func (r *IngressRouteReconciler) Reconcile(
+ 
+ // SetupWithManager sets up the controller with the Manager.
+ func (r *IngressRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+-	builder := ctrl.NewControllerManagedBy(mgr).For(&traefik.IngressRoute{})
+-	builder = builderWithIntegrations(builder, r.integrations, r, r.logger)
+-	return builder.Complete(r)
++	bld := ctrl.NewControllerManagedBy(mgr).For(&traefik.IngressRoute{})
++	bld = builderWithIntegrations(bld, r.integrations, r, r.logger, r.isManagedRoute)
++	// When a namespace selector is configured, watch namespace labels so that taking over or
++	// releasing a namespace re-reconciles its ingress routes. Only label changes (and initial
++	// discoveries) are relevant.
++	if r.selector.RestrictsNamespaces() {
++		bld = bld.Watches(
++			&v1.Namespace{},
++			handler.EnqueueRequestsFromMapFunc(r.enqueueIngressRoutesInNamespace),
++			builder.WithPredicates(predicate.LabelChangedPredicate{}),
++		)
++	}
++	return bld.Complete(r)
+ }
+diff --git a/internal/controllers/ingressroute_namespace_test.go b/internal/controllers/ingressroute_namespace_test.go
+new file mode 100644
+index 0000000..d83769e
+--- /dev/null
++++ b/internal/controllers/ingressroute_namespace_test.go
+@@ -0,0 +1,315 @@
++package controllers
++
++import (
++	"context"
++	"log/slog"
++	"testing"
++
++	configv1 "github.com/borchero/switchboard/internal/config/v1"
++	"github.com/borchero/switchboard/internal/k8tests"
++	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
++	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	v1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	controllerruntime "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	externaldnsv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
++	"sigs.k8s.io/external-dns/endpoint"
++)
++
++const namespaceLabelKey = "switchboard.borchero.com/ingress"
++
++func namespaceSelectorConfig() configv1.Config {
++	return configv1.Config{
++		Selector: configv1.IngressSelector{
++			NamespaceSelector: &metav1.LabelSelector{
++				MatchLabels: map[string]string{namespaceLabelKey: "enabled"},
++			},
++		},
++		Integrations: configv1.IntegrationConfigs{
++			ExternalDNS: &configv1.ExternalDNSIntegrationConfig{
++				TargetIPs: []string{"127.0.0.1"},
++			},
++			CertManager: &configv1.CertManagerIntegrationConfig{
++				Template: certmanager.Certificate{
++					Spec: certmanager.CertificateSpec{
++						IssuerRef: cmmeta.IssuerReference{
++							Kind: "ClusterIssuer",
++							Name: "my-issuer",
++						},
++					},
++				},
++			},
++		},
++	}
++}
++
++func selectorTestIngressRoute(namespace string) traefik.IngressRoute {
++	return traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress",
++			Namespace: namespace,
++			UID:       "owner-uid",
++		},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind:  "Rule",
++				Match: "Host(`www.example.com`)",
++				Services: []traefik.Service{{
++					LoadBalancerSpec: traefik.LoadBalancerSpec{Name: "nginx"},
++				}},
++			}},
++			TLS: &traefik.TLS{
++				SecretName: "www-tls-certificate",
++			},
++		},
++	}
++}
++
++func reconcileOnce(
++	t *testing.T, reconciler IngressRouteReconciler, ingress traefik.IngressRoute,
++) {
++	_, err := reconciler.Reconcile(context.Background(), controllerruntime.Request{
++		NamespacedName: types.NamespacedName{
++			Name:      ingress.Name,
++			Namespace: ingress.Namespace,
++		},
++	})
++	require.Nil(t, err)
++}
++
++func TestNewIngressRouteReconcilerNamespaceSelector(t *testing.T) {
++	scheme := k8tests.NewScheme()
++	ctrlClient := fake.NewClientBuilder().WithScheme(scheme).Build()
++
++	// An invalid selector causes construction (and, thus, startup) to fail
++	invalid := namespaceSelectorConfig()
++	invalid.Selector.NamespaceSelector = &metav1.LabelSelector{
++		MatchExpressions: []metav1.LabelSelectorRequirement{{
++			Key: "environment", Operator: "Bogus",
++		}},
++	}
++	_, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), invalid)
++	require.NotNil(t, err)
++
++	// No selector: cluster-wide operation
++	clusterWide, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), configv1.Config{})
++	require.Nil(t, err)
++	assert.False(t, clusterWide.selector.RestrictsNamespaces())
++
++	// Empty, but present selector: matches all namespaces but installs the namespace gating
++	empty := configv1.Config{Selector: configv1.IngressSelector{
++		NamespaceSelector: &metav1.LabelSelector{},
++	}}
++	restricted, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), empty)
++	require.Nil(t, err)
++	assert.True(t, restricted.selector.RestrictsNamespaces())
++}
++
++func TestReconcileNamespaceLookupFailurePreservesResources(t *testing.T) {
++	// Setup: the namespace does not exist in the (fake) cache, so looking it up fails.
++	scheme := k8tests.NewScheme()
++	ingress := selectorTestIngressRoute("missing-namespace")
++	certificate := certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: "missing-namespace",
++			OwnerReferences: []metav1.OwnerReference{{
++				APIVersion: "traefik.io/v1alpha1",
++				Kind:       "IngressRoute",
++				Name:       "my-ingress",
++				UID:        "owner-uid",
++				Controller: boolPtr(true),
++			}},
++		},
++	}
++	ctrlClient := fake.NewClientBuilder().
++		WithScheme(scheme).
++		WithObjects(&ingress, &certificate).
++		Build()
++
++	reconciler, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), namespaceSelectorConfig())
++	require.Nil(t, err)
++
++	// The reconcile must fail (retriable) and must not delete the existing certificate.
++	_, err = reconciler.Reconcile(context.Background(), controllerruntime.Request{
++		NamespacedName: types.NamespacedName{
++			Name:      "my-ingress",
++			Namespace: "missing-namespace",
++		},
++	})
++	require.NotNil(t, err)
++
++	var actual certmanager.Certificate
++	err = ctrlClient.Get(context.Background(),
++		types.NamespacedName{Name: "my-ingress-tls", Namespace: "missing-namespace"}, &actual,
++	)
++	require.Nil(t, err)
++}
++
++func TestReconcileNamespaceSelectorLifecycle(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++
++	namespace := v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "my-namespace"}}
++	ingress := selectorTestIngressRoute(namespace.Name)
++
++	// Foreign resources use the same names as the derived resources but are not owned by the
++	// ingress route.
++	foreignCertificate := certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: namespace.Name,
++			Labels:    map[string]string{"external": "true"},
++		},
++		Spec: certmanager.CertificateSpec{SecretName: "foreign-secret"},
++	}
++	foreignEndpoint := externaldnsv1alpha1.DNSEndpoint{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress",
++			Namespace: namespace.Name,
++			Labels:    map[string]string{"external": "true"},
++		},
++		Spec: externaldnsv1alpha1.DNSEndpointSpec{
++			Endpoints: []*endpoint.Endpoint{{
++				DNSName:    "foreign.example.com",
++				Targets:    []string{"10.0.0.1"},
++				RecordType: "A",
++			}},
++		},
++	}
++
++	ctrlClient := fake.NewClientBuilder().
++		WithScheme(scheme).
++		WithObjects(&namespace, &ingress, &foreignCertificate, &foreignEndpoint).
++		Build()
++	reconciler, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), namespaceSelectorConfig())
++	require.Nil(t, err)
++
++	certKey := types.NamespacedName{Name: "my-ingress-tls", Namespace: namespace.Name}
++	endpointKey := types.NamespacedName{Name: "my-ingress", Namespace: namespace.Name}
++
++	// 1) The namespace does not match initially: foreign resources must be left untouched.
++	reconcileOnce(t, reconciler, ingress)
++
++	var actualCertificate certmanager.Certificate
++	require.Nil(t, ctrlClient.Get(ctx, certKey, &actualCertificate))
++	assert.Equal(t, "foreign-secret", actualCertificate.Spec.SecretName)
++	assert.Empty(t, actualCertificate.OwnerReferences)
++	assert.Equal(t, "true", actualCertificate.Labels["external"])
++
++	var actualEndpoint externaldnsv1alpha1.DNSEndpoint
++	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &actualEndpoint))
++	assert.Equal(t, "foreign.example.com", actualEndpoint.Spec.Endpoints[0].DNSName)
++	assert.Empty(t, actualEndpoint.OwnerReferences)
++
++	// 2) The label is added: Switchboard takes over (adopts the existing objects) and repairs
++	// their specifications.
++	var labeledNamespace v1.Namespace
++	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: namespace.Name}, &labeledNamespace))
++	labeledNamespace.Labels = map[string]string{namespaceLabelKey: "enabled"}
++	require.Nil(t, ctrlClient.Update(ctx, &labeledNamespace))
++
++	reconcileOnce(t, reconciler, ingress)
++
++	require.Nil(t, ctrlClient.Get(ctx, certKey, &actualCertificate))
++	assert.True(t, metav1.IsControlledBy(&actualCertificate, &ingress))
++	assert.Equal(t, "www-tls-certificate", actualCertificate.Spec.SecretName)
++	assert.ElementsMatch(t, []string{"www.example.com"}, actualCertificate.Spec.DNSNames)
++	assert.Equal(t, "switchboard", actualCertificate.Labels["kubernetes.io/managed-by"])
++
++	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &actualEndpoint))
++	assert.True(t, metav1.IsControlledBy(&actualEndpoint, &ingress))
++	require.Len(t, actualEndpoint.Spec.Endpoints, 1)
++	assert.Equal(t, "www.example.com", actualEndpoint.Spec.Endpoints[0].DNSName)
++	assert.ElementsMatch(t, []string{"127.0.0.1"}, actualEndpoint.Spec.Endpoints[0].Targets)
++
++	// 3) The label is removed: only the owned resources are deleted. Recreate the foreign
++	// resources first to prove they remain untouched.
++	var unlabeledNamespace v1.Namespace
++	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: namespace.Name}, &unlabeledNamespace))
++	unlabeledNamespace.Labels = map[string]string{}
++	require.Nil(t, ctrlClient.Update(ctx, &unlabeledNamespace))
++
++	reconcileOnce(t, reconciler, ingress)
++
++	err = ctrlClient.Get(ctx, certKey, &certmanager.Certificate{})
++	assert.True(t, apierrors.IsNotFound(err))
++	err = ctrlClient.Get(ctx, endpointKey, &externaldnsv1alpha1.DNSEndpoint{})
++	assert.True(t, apierrors.IsNotFound(err))
++
++	// 4) The label is restored: the derived resources are rebuilt.
++	var relabeledNamespace v1.Namespace
++	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: namespace.Name}, &relabeledNamespace))
++	relabeledNamespace.Labels = map[string]string{namespaceLabelKey: "enabled"}
++	require.Nil(t, ctrlClient.Update(ctx, &relabeledNamespace))
++
++	reconcileOnce(t, reconciler, ingress)
++
++	require.Nil(t, ctrlClient.Get(ctx, certKey, &actualCertificate))
++	assert.True(t, metav1.IsControlledBy(&actualCertificate, &ingress))
++	assert.Equal(t, "www-tls-certificate", actualCertificate.Spec.SecretName)
++	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &actualEndpoint))
++	assert.True(t, metav1.IsControlledBy(&actualEndpoint, &ingress))
++	require.Len(t, actualEndpoint.Spec.Endpoints, 1)
++	assert.ElementsMatch(t, []string{"127.0.0.1"}, actualEndpoint.Spec.Endpoints[0].Targets)
++}
++
++func TestReconcileOutOfScopeKeepsForeignResources(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++
++	// The namespace is explicitly labeled with a non-matching value.
++	namespace := v1.Namespace{ObjectMeta: metav1.ObjectMeta{
++		Name:   "my-namespace",
++		Labels: map[string]string{namespaceLabelKey: "disabled"},
++	}}
++	ingress := selectorTestIngressRoute(namespace.Name)
++	foreignCertificate := certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: namespace.Name,
++			Labels:    map[string]string{"external": "true"},
++		},
++		Spec: certmanager.CertificateSpec{SecretName: "foreign-secret"},
++	}
++	foreignEndpoint := externaldnsv1alpha1.DNSEndpoint{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress",
++			Namespace: namespace.Name,
++			Labels:    map[string]string{"external": "true"},
++		},
++	}
++
++	ctrlClient := fake.NewClientBuilder().
++		WithScheme(scheme).
++		WithObjects(&namespace, &ingress, &foreignCertificate, &foreignEndpoint).
++		Build()
++	reconciler, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), namespaceSelectorConfig())
++	require.Nil(t, err)
++
++	reconcileOnce(t, reconciler, ingress)
++
++	var actualCertificate certmanager.Certificate
++	require.Nil(t, ctrlClient.Get(ctx,
++		types.NamespacedName{Name: "my-ingress-tls", Namespace: namespace.Name}, &actualCertificate,
++	))
++	assert.Equal(t, "foreign-secret", actualCertificate.Spec.SecretName)
++	assert.Empty(t, actualCertificate.OwnerReferences)
++
++	var actualEndpoint externaldnsv1alpha1.DNSEndpoint
++	require.Nil(t, ctrlClient.Get(ctx,
++		types.NamespacedName{Name: "my-ingress", Namespace: namespace.Name}, &actualEndpoint,
++	))
++	assert.Empty(t, actualEndpoint.OwnerReferences)
++	assert.Equal(t, "true", actualEndpoint.Labels["external"])
++}
++
++func boolPtr(value bool) *bool {
++	return &value
++}
+diff --git a/internal/controllers/ingressroute_test.go b/internal/controllers/ingressroute_test.go
+index 9d7d44c..c71b9ef 100644
+--- a/internal/controllers/ingressroute_test.go
++++ b/internal/controllers/ingressroute_test.go
+@@ -179,6 +179,72 @@ func TestIngressHeader(t *testing.T) {
+ 	})
+ }
+ 
++func TestIngressNamespaceSelector(t *testing.T) {
++	// Setup
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	ctrlClient := k8tests.NewClient(t, scheme)
++	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
++	defer shutdown()
++
++	service := k8tests.DummyService("traefik", namespace, 80)
++	require.Nil(t, ctrlClient.Create(ctx, &service))
++
++	ingress := traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{Name: "my-ingress"},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind:  "Rule",
++				Match: "Host(`www.example.com`)",
++				Services: []traefik.Service{{
++					LoadBalancerSpec: traefik.LoadBalancerSpec{Name: "nginx"},
++				}},
++			}},
++			TLS: &traefik.TLS{SecretName: "www-tls-certificate"},
++		},
++	}
++	ingress.Namespace = namespace
++	require.Nil(t, ctrlClient.Create(ctx, &ingress))
++
++	enabledLabels := map[string]string{namespaceLabelKey: "enabled"}
++	config := createConfig(&service)
++	config.Selector.NamespaceSelector = &metav1.LabelSelector{MatchLabels: enabledLabels}
++
++	certificateKey := types.NamespacedName{Name: "my-ingress-tls", Namespace: namespace}
++	endpointKey := types.NamespacedName{Name: "my-ingress", Namespace: namespace}
++
++	// 1) The unlabeled namespace is out of scope: no derived resources are created.
++	runReconciliation(ctx, t, ctrlClient, ingress, config)
++	var certificate certmanager.Certificate
++	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, certificateKey, &certificate)))
++	var dnsEndpoint externaldnsv1alpha1.DNSEndpoint
++	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, endpointKey, &dnsEndpoint)))
++
++	// 2) Labeling the namespace takes the ingress route over.
++	setNamespaceLabels(ctx, t, ctrlClient, namespace, enabledLabels)
++	runReconciliation(ctx, t, ctrlClient, ingress, config)
++	require.Nil(t, ctrlClient.Get(ctx, certificateKey, &certificate))
++	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &dnsEndpoint))
++	var managed traefik.IngressRoute
++	require.Nil(t, ctrlClient.Get(ctx,
++		types.NamespacedName{Name: ingress.Name, Namespace: namespace}, &managed,
++	))
++	assert.True(t, metav1.IsControlledBy(&certificate, &managed))
++	assert.True(t, metav1.IsControlledBy(&dnsEndpoint, &managed))
++
++	// 3) Removing the label releases only the owned derived resources.
++	setNamespaceLabels(ctx, t, ctrlClient, namespace, map[string]string{})
++	runReconciliation(ctx, t, ctrlClient, ingress, config)
++	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, certificateKey, &certificate)))
++	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, endpointKey, &dnsEndpoint)))
++
++	// 4) Re-adding the label rebuilds the derived resources.
++	setNamespaceLabels(ctx, t, ctrlClient, namespace, enabledLabels)
++	runReconciliation(ctx, t, ctrlClient, ingress, config)
++	require.Nil(t, ctrlClient.Get(ctx, certificateKey, &certificate))
++	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &dnsEndpoint))
++}
++
+ //-------------------------------------------------------------------------------------------------
+ // TESTING UTILITIES
+ //-------------------------------------------------------------------------------------------------
+@@ -188,6 +254,15 @@ type testCase struct {
+ 	DNSNames []string
+ }
+ 
++func setNamespaceLabels(
++	ctx context.Context, t *testing.T, ctrlClient client.Client, name string, labels map[string]string,
++) {
++	var namespace v1.Namespace
++	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: name}, &namespace))
++	namespace.Labels = labels
++	require.Nil(t, ctrlClient.Update(ctx, &namespace))
++}
++
+ func runTest(t *testing.T, test testCase) {
+ 	// Setup
+ 	ctx := context.Background()
+diff --git a/internal/controllers/utils.go b/internal/controllers/utils.go
+index d53288e..73a77ad 100644
+--- a/internal/controllers/utils.go
++++ b/internal/controllers/utils.go
+@@ -1,6 +1,7 @@
+ package controllers
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"log/slog"
+ 
+@@ -54,6 +55,7 @@ func builderWithIntegrations(
+ 	integrations []integrations.Integration,
+ 	ctrlClient client.Client,
+ 	logger *slog.Logger,
++	isManaged func(context.Context, client.Object) bool,
+ ) *builder.Builder {
+ 	// Reconcile whenever an owned resource of one of the integrations is modified
+ 	for _, itg := range integrations {
+@@ -70,6 +72,7 @@ func builderWithIntegrations(
+ 						return &v
+ 					})
+ 				},
++				isManaged,
+ 			)
+ 			builder = builder.Watches(
+ 				itg.WatchedObject(),
+diff --git a/internal/controllers/watches.go b/internal/controllers/watches.go
+new file mode 100644
+index 0000000..e210756
+--- /dev/null
++++ b/internal/controllers/watches.go
+@@ -0,0 +1,62 @@
++package controllers
++
++import (
++	"context"
++
++	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	v1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++)
++
++// isManagedRoute determines whether the given object (expected to be an IngressRoute) is
++// currently taken over by Switchboard: it must be located in a matching namespace (if a
++// namespace selector is configured) and its annotations must match the ingress class / ignore
++// rules. If namespace membership cannot be determined because the namespace lookup fails, the
++// route is considered not managed: enqueueing nothing preserves existing derived resources and
++// the regular reconcile loop converges once the API is available again.
++func (r *IngressRouteReconciler) isManagedRoute(
++	ctx context.Context, obj client.Object,
++) bool {
++	if r.selector.RestrictsNamespaces() {
++		var namespace v1.Namespace
++		if err := r.Get(
++			ctx, client.ObjectKey{Name: obj.GetNamespace()}, &namespace,
++		); err != nil {
++			r.logger.Error("unable to query namespace while filtering routes to enqueue",
++				"namespace", obj.GetNamespace(), "error", err,
++			)
++			return false
++		}
++		if !r.selector.MatchesNamespace(namespace.Labels) {
++			return false
++		}
++	}
++	return r.selector.Matches(obj.GetAnnotations())
++}
++
++// enqueueIngressRoutesInNamespace maps a namespace event to reconciliation requests for all
++// (and only) the ingress routes located in that namespace. A failure to list the routes does
++// not release any resources (no reconcile is triggered) and is logged: the event is retried
++// implicitly through subsequent events and the informer resync.
++func (r *IngressRouteReconciler) enqueueIngressRoutesInNamespace(
++	ctx context.Context, obj client.Object,
++) []reconcile.Request {
++	if _, ok := obj.(*v1.Namespace); !ok {
++		return nil
++	}
++	var routes traefik.IngressRouteList
++	if err := r.List(ctx, &routes, client.InNamespace(obj.GetName())); err != nil {
++		r.logger.Error("failed to list ingress routes in changed namespace",
++			"namespace", obj.GetName(), "error", err,
++		)
++		return nil
++	}
++	requests := make([]reconcile.Request, 0, len(routes.Items))
++	for i := range routes.Items {
++		requests = append(requests, reconcile.Request{
++			NamespacedName: client.ObjectKeyFromObject(&routes.Items[i]),
++		})
++	}
++	return requests
++}
+diff --git a/internal/controllers/watches_test.go b/internal/controllers/watches_test.go
+new file mode 100644
+index 0000000..d0a769b
+--- /dev/null
++++ b/internal/controllers/watches_test.go
+@@ -0,0 +1,72 @@
++package controllers
++
++import (
++	"context"
++	"log/slog"
++	"testing"
++
++	"github.com/borchero/switchboard/internal/k8tests"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++func TestEnqueueIngressRoutesInNamespace(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	ctrlClient := k8tests.NewClient(t, scheme)
++
++	namespaceA, shutdownA := k8tests.NewNamespace(ctx, t, ctrlClient)
++	defer shutdownA()
++	namespaceB, shutdownB := k8tests.NewNamespace(ctx, t, ctrlClient)
++	defer shutdownB()
++	setNamespaceLabels(ctx, t, ctrlClient, namespaceA,
++		map[string]string{namespaceLabelKey: "enabled"},
++	)
++
++	routeA := traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{Name: "ingress-a", Namespace: namespaceA},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind: "Rule", Match: "Host(`a.example.com`)",
++			}},
++		},
++	}
++	require.Nil(t, ctrlClient.Create(ctx, &routeA))
++	routeB := traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{Name: "ingress-b", Namespace: namespaceB},
++		Spec: traefik.IngressRouteSpec{
++			Routes: []traefik.Route{{
++				Kind: "Rule", Match: "Host(`b.example.com`)",
++			}},
++		},
++	}
++	require.Nil(t, ctrlClient.Create(ctx, &routeB))
++
++	reconciler, err := NewIngressRouteReconciler(ctrlClient, slog.Default(), namespaceSelectorConfig())
++	require.Nil(t, err)
++
++	// A namespace event enqueues all (and only) ingress routes of that namespace.
++	var namespaceObjectA v1.Namespace
++	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: namespaceA}, &namespaceObjectA))
++	requestsA := reconciler.enqueueIngressRoutesInNamespace(ctx, &namespaceObjectA)
++	require.Len(t, requestsA, 1)
++	assert.Equal(t, "ingress-a", requestsA[0].Name)
++	assert.Equal(t, namespaceA, requestsA[0].Namespace)
++
++	var namespaceObjectB v1.Namespace
++	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: namespaceB}, &namespaceObjectB))
++	requestsB := reconciler.enqueueIngressRoutesInNamespace(ctx, &namespaceObjectB)
++	require.Len(t, requestsB, 1)
++	assert.Equal(t, "ingress-b", requestsB[0].Name)
++
++	// Objects other than namespaces are ignored.
++	assert.Nil(t, reconciler.enqueueIngressRoutesInNamespace(ctx, &v1.Service{}))
++
++	// Only routes in matching namespaces are currently managed.
++	assert.True(t, reconciler.isManagedRoute(ctx, &routeA))
++	assert.False(t, reconciler.isManagedRoute(ctx, &routeB))
++}
+diff --git a/internal/integrations/certmanager.go b/internal/integrations/certmanager.go
+index b4e52de..6fca70e 100644
+--- a/internal/integrations/certmanager.go
++++ b/internal/integrations/certmanager.go
+@@ -72,6 +72,14 @@ func (c *certManager) UpdateResource(
+ 	return nil
+ }
+ 
++func (c *certManager) DeleteResource(ctx context.Context, owner metav1.Object) error {
++	certificate := certmanager.Certificate{ObjectMeta: c.objectMeta(owner)}
++	if err := k8s.DeleteIfOwned(ctx, c.client, &certificate, owner); err != nil {
++		return fmt.Errorf("failed to delete TLS certificate: %w", err)
++	}
++	return nil
++}
++
+ //-------------------------------------------------------------------------------------------------
+ // UTILS
+ //-------------------------------------------------------------------------------------------------
+diff --git a/internal/integrations/externaldns.go b/internal/integrations/externaldns.go
+index f25468a..a28a32b 100644
+--- a/internal/integrations/externaldns.go
++++ b/internal/integrations/externaldns.go
+@@ -88,6 +88,14 @@ func (e *externalDNS) UpdateResource(
+ 	return nil
+ }
+ 
++func (e *externalDNS) DeleteResource(ctx context.Context, owner metav1.Object) error {
++	dnsEndpoint := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
++	if err := k8s.DeleteIfOwned(ctx, e.client, &dnsEndpoint, owner); err != nil {
++		return fmt.Errorf("failed to delete DNS endpoint: %w", err)
++	}
++	return nil
++}
++
+ //-------------------------------------------------------------------------------------------------
+ // UTILS
+ //-------------------------------------------------------------------------------------------------
+diff --git a/internal/integrations/interface.go b/internal/integrations/interface.go
+index 1cdafca..c936aa0 100644
+--- a/internal/integrations/interface.go
++++ b/internal/integrations/interface.go
+@@ -40,4 +40,9 @@ type Integration interface {
+ 	// All information the generated resource is derived from the integration's global
+ 	// configuration along with the given ingress information.
+ 	UpdateResource(ctx context.Context, owner metav1.Object, info IngressInfo) error
++
++	// DeleteResource releases the resource derived from the given owner when the owner leaves
++	// the controller's scope. The resource is only deleted if it exists and is actually
++	// controlled by the owner: same-named resources owned by anyone else are never touched.
++	DeleteResource(ctx context.Context, owner metav1.Object) error
+ }
+diff --git a/internal/k8s/delete.go b/internal/k8s/delete.go
+index 00f3ef7..fda0ab0 100644
+--- a/internal/k8s/delete.go
++++ b/internal/k8s/delete.go
+@@ -5,6 +5,8 @@ import (
+ 	"fmt"
+ 
+ 	apierrs "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
+@@ -19,3 +21,29 @@ func DeleteIfFound(ctx context.Context, client client.Client, resource client.Ob
+ 	}
+ 	return nil
+ }
++
++// DeleteIfOwned deletes the given resource only if it exists and is controlled by the provided
++// owner. If the resource does not exist or is owned by someone else (e.g. a same-named resource
++// created externally), it is left untouched and no error is returned.
++func DeleteIfOwned(
++	ctx context.Context, client client.Client, resource client.Object, owner metav1.Object,
++) error {
++	key := types.NamespacedName{Name: resource.GetName(), Namespace: resource.GetNamespace()}
++	if err := client.Get(ctx, key, resource); err != nil {
++		if apierrs.IsNotFound(err) {
++			return nil
++		}
++		return fmt.Errorf("failed to look up existing resource: %w", err)
++	}
++	if !metav1.IsControlledBy(resource, owner) {
++		// A same-named resource exists that is not owned by us: we must never touch it.
++		return nil
++	}
++	if err := client.Delete(ctx, resource); err != nil {
++		if apierrs.IsNotFound(err) {
++			return nil
++		}
++		return fmt.Errorf("failed to delete owned resource: %w", err)
++	}
++	return nil
++}
+diff --git a/internal/k8s/delete_test.go b/internal/k8s/delete_test.go
+index ec5c257..70ee9b2 100644
+--- a/internal/k8s/delete_test.go
++++ b/internal/k8s/delete_test.go
+@@ -7,6 +7,9 @@ import (
+ 	"github.com/borchero/switchboard/internal/k8tests"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/types"
++	ctrl "sigs.k8s.io/controller-runtime"
+ )
+ 
+ func TestDeleteIfFound(t *testing.T) {
+@@ -29,3 +32,52 @@ func TestDeleteIfFound(t *testing.T) {
+ 	err = DeleteIfFound(ctx, client, &service)
+ 	assert.Nil(t, err)
+ }
++
++func TestDeleteIfOwned(t *testing.T) {
++	// Setup
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	ctrlClient := k8tests.NewClient(t, scheme)
++	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
++	defer shutdown()
++
++	// The owner controls a first (owned) service while a second service of the same shape is
++	// created externally.
++	owner := k8tests.DummyService("owner", namespace, 80)
++	err := ctrlClient.Create(ctx, &owner)
++	require.Nil(t, err)
++
++	owned := k8tests.DummyService("owned", namespace, 80)
++	err = ctrl.SetControllerReference(&owner, &owned, scheme)
++	require.Nil(t, err)
++	err = ctrlClient.Create(ctx, &owned)
++	require.Nil(t, err)
++
++	foreign := k8tests.DummyService("foreign", namespace, 80)
++	err = ctrlClient.Create(ctx, &foreign)
++	require.Nil(t, err)
++
++	// The owned resource is deleted while the foreign resource is left untouched
++	ownedLookup := k8tests.DummyService("owned", namespace, 80)
++	err = DeleteIfOwned(ctx, ctrlClient, &ownedLookup, &owner)
++	assert.Nil(t, err)
++
++	ownedAfterDelete := k8tests.DummyService("owned", namespace, 80)
++	err = ctrlClient.Get(ctx, types.NamespacedName{Name: "owned", Namespace: namespace}, &ownedAfterDelete)
++	assert.True(t, apierrors.IsNotFound(err))
++
++	foreignLookup := k8tests.DummyService("foreign", namespace, 80)
++	err = DeleteIfOwned(ctx, ctrlClient, &foreignLookup, &owner)
++	assert.Nil(t, err)
++	foreignActual := k8tests.DummyService("foreign", namespace, 80)
++	err = ctrlClient.Get(ctx, types.NamespacedName{Name: "foreign", Namespace: namespace}, &foreignActual)
++	assert.Nil(t, err)
++
++	// A missing resource and repeated calls do not result in errors
++	ownedLookup2 := k8tests.DummyService("owned", namespace, 80)
++	err = DeleteIfOwned(ctx, ctrlClient, &ownedLookup2, &owner)
++	assert.Nil(t, err)
++	missing := k8tests.DummyService("missing", namespace, 80)
++	err = DeleteIfOwned(ctx, ctrlClient, &missing, &owner)
++	assert.Nil(t, err)
++}
+diff --git a/internal/k8s/enqueue.go b/internal/k8s/enqueue.go
+index cf60dd5..49f1546 100644
+--- a/internal/k8s/enqueue.go
++++ b/internal/k8s/enqueue.go
+@@ -9,14 +9,17 @@ import (
+ )
+ 
+ // EnqueueMapFunc may be used to watch changes of a particular target objects and trigger the
+-// reconciliation of all resources of a particular type. The given logger is used to log errors in
+-// the background.
++// reconciliation of resources of a particular type. Only events for the exact target object
++// (matching kind, namespace, and name) cause resources to be enqueued. If `isManaged` is not
++// nil, it is evaluated for every candidate resource and only resources for which it returns
++// `true` are enqueued. The given logger is used to log errors in the background.
+ func EnqueueMapFunc[L client.ObjectList](
+ 	ctrlClient client.Client,
+ 	logger *slog.Logger,
+ 	target client.Object,
+ 	list L,
+ 	getItems func(L) []client.Object,
++	isManaged func(context.Context, client.Object) bool,
+ ) func(context.Context, client.Object) []reconcile.Request {
+ 	return func(ctx context.Context, obj client.Object) []reconcile.Request {
+ 		// Check whether we need to enqueue any objects
+@@ -34,10 +37,14 @@ func EnqueueMapFunc[L client.ObjectList](
+ 
+ 		// ...and map them to reconciliation requests
+ 		items := getItems(list)
+-		requests := make([]reconcile.Request, len(items))
+-		for i, item := range items {
+-			requests[i].Name = item.GetName()
+-			requests[i].Namespace = item.GetNamespace()
++		requests := make([]reconcile.Request, 0, len(items))
++		for _, item := range items {
++			if isManaged != nil && !isManaged(ctx, item) {
++				continue
++			}
++			requests = append(requests, reconcile.Request{
++				NamespacedName: client.ObjectKeyFromObject(item),
++			})
+ 		}
+ 		return requests
+ 	}
+diff --git a/internal/k8s/enqueue_test.go b/internal/k8s/enqueue_test.go
+index 2fe3c0b..02c6d5d 100644
+--- a/internal/k8s/enqueue_test.go
++++ b/internal/k8s/enqueue_test.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/stretchr/testify/require"
+ 	v1 "k8s.io/api/core/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ )
+ 
+ func TestEnqueueMapFunc(t *testing.T) {
+@@ -39,6 +40,7 @@ func TestEnqueueMapFunc(t *testing.T) {
+ 		func(list *v1.ServiceList) []client.Object {
+ 			return ext.Map(list.Items, func(v v1.Service) client.Object { return &v })
+ 		},
++		nil,
+ 	)
+ 
+ 	// Check whether enqueue only happens for service1
+@@ -57,3 +59,47 @@ func TestEnqueueMapFunc(t *testing.T) {
+ 	}
+ 	assert.ElementsMatch(t, names, found)
+ }
++
++func TestEnqueueMapFuncWithFilter(t *testing.T) {
++	// Setup
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	ctrlClient := k8tests.NewClient(t, scheme)
++	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
++	defer shutdown()
++
++	// Create a couple of services
++	service1 := k8tests.DummyService("my-service-1", namespace, 80)
++	err := ctrlClient.Create(ctx, &service1)
++	require.Nil(t, err)
++	service2 := k8tests.DummyService("my-service-2", namespace, 80)
++	err = ctrlClient.Create(ctx, &service2)
++	require.Nil(t, err)
++	service3 := k8tests.DummyService("my-service-3", namespace, 80)
++	err = ctrlClient.Create(ctx, &service3)
++	require.Nil(t, err)
++
++	// Only services whose name is "my-service-2" are considered managed
++	var services v1.ServiceList
++	enqueuer := EnqueueMapFunc(
++		ctrlClient, slog.Default(), &service1, &services,
++		func(list *v1.ServiceList) []client.Object {
++			return ext.Map(list.Items, func(v v1.Service) client.Object { return &v })
++		},
++		func(_ context.Context, obj client.Object) bool {
++			return obj.GetName() == "my-service-2"
++		},
++	)
++
++	// The filter must restrict the enqueued resources to managed ones
++	requests := enqueuer(ctx, &service1)
++	var inNamespace []reconcile.Request
++	for _, request := range requests {
++		if request.Namespace == namespace {
++			inNamespace = append(inNamespace, request)
++		}
++	}
++	assert.Len(t, inNamespace, 1)
++	assert.Equal(t, "my-service-2", inNamespace[0].Name)
++	assert.Equal(t, namespace, inNamespace[0].Namespace)
++}
+diff --git a/internal/switchboard/selector.go b/internal/switchboard/selector.go
+index c05ebe3..b7c7aea 100644
+--- a/internal/switchboard/selector.go
++++ b/internal/switchboard/selector.go
+@@ -1,6 +1,10 @@
+ package switchboard
+ 
+-import "strings"
++import (
++	"strings"
++
++	"k8s.io/apimachinery/pkg/labels"
++)
+ 
+ const (
+ 	ingressAnnotationKey = "kubernetes.io/ingress.class"
+@@ -10,12 +14,31 @@ const (
+ // Selector allows to easily determine if a resource with a set of annotations should be processed.
+ type Selector struct {
+ 	ingressClass *string
++	// namespaceSelector optionally restricts processing to namespaces matching the selector. If
++	// it is nil, all namespaces are in scope (cluster-wide operation).
++	namespaceSelector labels.Selector
+ }
+ 
+ // NewSelector creates a new selector which selects resources with the
+-// `kubernetes.io/ingress.class` set to the specified value if it is not `nil`.
+-func NewSelector(ingressClass *string) Selector {
+-	return Selector{ingressClass}
++// `kubernetes.io/ingress.class` set to the specified value if it is not `nil`. If
++// `namespaceSelector` is not nil, only resources in namespaces matching the selector are in
++// scope.
++func NewSelector(ingressClass *string, namespaceSelector labels.Selector) Selector {
++	return Selector{ingressClass, namespaceSelector}
++}
++
++// RestrictsNamespaces returns whether the selector limits processing to a subset of namespaces.
++func (s Selector) RestrictsNamespaces() bool {
++	return s.namespaceSelector != nil
++}
++
++// MatchesNamespace determines whether the provided set of namespace labels matches the selector.
++// If no namespace selector is configured, every namespace matches.
++func (s Selector) MatchesNamespace(namespaceLabels map[string]string) bool {
++	if s.namespaceSelector == nil {
++		return true
++	}
++	return s.namespaceSelector.Matches(labels.Set(namespaceLabels))
+ }
+ 
+ // Matches determines whether the provided set of annotation match the selector. If the method
+diff --git a/internal/switchboard/selector_test.go b/internal/switchboard/selector_test.go
+index 1925d65..b2b20a8 100644
+--- a/internal/switchboard/selector_test.go
++++ b/internal/switchboard/selector_test.go
+@@ -4,10 +4,11 @@ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+ func TestMatchesNoIngressClass(t *testing.T) {
+-	selector := NewSelector(nil)
++	selector := NewSelector(nil, nil)
+ 	assert.True(t, selector.Matches(map[string]string{}))
+ 	assert.True(t, selector.Matches(map[string]string{
+ 		"kubernetes.io/ingress.class": "test",
+@@ -30,7 +31,7 @@ func TestMatchesNoIngressClass(t *testing.T) {
+ 
+ func TestMatchesIngressClass(t *testing.T) {
+ 	cls := "ingress"
+-	selector := NewSelector(&cls)
++	selector := NewSelector(&cls, nil)
+ 	assert.False(t, selector.Matches(map[string]string{}))
+ 	assert.False(t, selector.Matches(map[string]string{
+ 		"kubernetes.io/ingress.class": "test",
+@@ -64,7 +65,7 @@ func TestMatchesIngressClass(t *testing.T) {
+ 
+ func TestMatchesIntegration(t *testing.T) {
+ 	cls := "ingress"
+-	selector := NewSelector(&cls)
++	selector := NewSelector(&cls, nil)
+ 
+ 	// Ignore all
+ 	assert.False(t, selector.MatchesIntegration(map[string]string{
+@@ -104,3 +105,61 @@ func TestMatchesIntegration(t *testing.T) {
+ 		"switchboard.borchero.com/ignore": "external-dns, cert-manager",
+ 	}, "unknown"))
+ }
++
++func TestMatchesNamespaceWithoutSelector(t *testing.T) {
++	selector := NewSelector(nil, nil)
++	assert.False(t, selector.RestrictsNamespaces())
++	assert.True(t, selector.MatchesNamespace(map[string]string{}))
++	assert.True(t, selector.MatchesNamespace(map[string]string{
++		"switchboard.borchero.com/ingress": "enabled",
++	}))
++}
++
++func TestMatchesNamespaceWithMatchLabels(t *testing.T) {
++	labelSelector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
++		MatchLabels: map[string]string{"switchboard.borchero.com/ingress": "enabled"},
++	})
++	assert.Nil(t, err)
++	selector := NewSelector(nil, labelSelector)
++	assert.True(t, selector.RestrictsNamespaces())
++
++	assert.False(t, selector.MatchesNamespace(map[string]string{}))
++	assert.False(t, selector.MatchesNamespace(map[string]string{
++		"switchboard.borchero.com/ingress": "disabled",
++	}))
++	assert.True(t, selector.MatchesNamespace(map[string]string{
++		"switchboard.borchero.com/ingress": "enabled",
++	}))
++	// Additional labels must not affect matching
++	assert.True(t, selector.MatchesNamespace(map[string]string{
++		"switchboard.borchero.com/ingress": "enabled",
++		"other":                            "label",
++	}))
++}
++
++func TestMatchesNamespaceWithMatchExpressions(t *testing.T) {
++	labelSelector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
++		MatchExpressions: []metav1.LabelSelectorRequirement{{
++			Key:      "environment",
++			Operator: metav1.LabelSelectorOpIn,
++			Values:   []string{"prod", "staging"},
++		}},
++	})
++	assert.Nil(t, err)
++	selector := NewSelector(nil, labelSelector)
++
++	assert.False(t, selector.MatchesNamespace(map[string]string{}))
++	assert.False(t, selector.MatchesNamespace(map[string]string{"environment": "dev"}))
++	assert.True(t, selector.MatchesNamespace(map[string]string{"environment": "prod"}))
++	assert.True(t, selector.MatchesNamespace(map[string]string{"environment": "staging"}))
++}
++
++func TestInvalidNamespaceSelector(t *testing.T) {
++	_, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
++		MatchExpressions: []metav1.LabelSelectorRequirement{{
++			Key:      "environment",
++			Operator: "Bogus",
++		}},
++	})
++	assert.NotNil(t, err)
++}

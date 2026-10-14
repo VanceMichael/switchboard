@@ -165,6 +165,36 @@ By setting the `ignore` annotation to `all` (or `true`), Switchboard does not pr
 more fine-grained control, the value of this annotation can also be set to a comma-separated list of integrations
 (possible values `cert-manager`, `external-dns`).
 
+#### Restrict Processing to Selected Namespaces
+
+By default, Switchboard operates cluster-wide and processes all `IngressRoute` objects (subject to the ingress class
+and ignore rules above). Cluster operators can additionally restrict automation to namespaces matching a label
+selector by setting `selector.namespaceSelector` in the configuration (or `selector.namespaceSelector` in the Helm
+values). Both `matchLabels` and `matchExpressions` are supported. An invalid selector causes Switchboard to fail at
+startup.
+
+```yaml
+# Helm values
+selector:
+  namespaceSelector:
+    matchLabels:
+      switchboard.borchero.com/ingress: enabled
+```
+
+The selector is re-evaluated on every reconciliation, so flipping namespace labels takes effect without touching
+individual ingress routes:
+
+- When a namespace starts matching, Switchboard creates or repairs the `Certificate` and `DNSEndpoint` of all
+  qualifying ingress routes in the namespace.
+- When a namespace stops matching, only the two kinds of derived resources that are owned by the respective ingress
+  route are removed. Same-named resources created by someone else are never touched.
+- When the namespace labels match again, the derived resources are re-created automatically.
+
+If reading namespace state temporarily fails (e.g. during an API server disruption), membership is considered
+unknown: existing derived resources are kept and the reconciliation is retried, converging against the actual labels
+once the API is available again. Changes of the configured target service likewise only trigger updates of routes
+that are currently taken over.
+
 ## License
 
 Switchboard is licensed under the [MIT License](./LICENSE).

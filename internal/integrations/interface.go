@@ -40,4 +40,9 @@ type Integration interface {
 	// All information the generated resource is derived from the integration's global
 	// configuration along with the given ingress information.
 	UpdateResource(ctx context.Context, owner metav1.Object, info IngressInfo) error
+
+	// DeleteResource releases the resource derived from the given owner when the owner leaves
+	// the controller's scope. The resource is only deleted if it exists and is actually
+	// controlled by the owner: same-named resources owned by anyone else are never touched.
+	DeleteResource(ctx context.Context, owner metav1.Object) error
 }

@@ -71,4 +71,5 @@ The following lists all values that may be set when installing this chart (see
 | replicas | int | `1` | The number of manager replicas to use. |
 | resources | object | `{}` | The resources to use for the operator. |
 | selector.ingressClass | string | `nil` | When set, Switchboard only processes ingress routes with the `kubernetes.io/ingress.class`    annotation set to this value. |
+| selector.namespaceSelector | object | `nil` | When set, Switchboard only takes over ingress routes in namespaces whose labels match this    label selector (supports `matchLabels` and `matchExpressions`). When a namespace starts    matching, the Certificate and DNSEndpoint resources are created or repaired; when it stops    matching, only the resources owned by Switchboard are removed and re-created once the    namespace matches again. Unset means Switchboard operates cluster-wide. |
 | tolerations | list | `[]` |  |

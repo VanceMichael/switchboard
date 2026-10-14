@@ -2,6 +2,7 @@ package v1
 
 import (
 	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Config is the Schema for the configs API
@@ -39,9 +40,14 @@ type MetricsConfig struct {
 
 //-------------------------------------------------------------------------------------------------
 
-// IngressSelector can be used to limit operations to ingresses with a specific class.
+// IngressSelector can be used to limit operations to ingresses with a specific class and/or to
+// ingresses located in namespaces matching a label selector.
 type IngressSelector struct {
 	IngressClass *string `json:"ingressClass,omitempty"`
+	// NamespaceSelector optionally restricts which namespaces Switchboard takes over ingress
+	// routes in. When unset, Switchboard operates cluster-wide. An invalid selector causes
+	// startup to fail.
+	NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
 }
 
 // IntegrationConfigs describes the configurations for all integrations.

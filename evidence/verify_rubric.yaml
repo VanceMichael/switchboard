@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: p2p
+    text: Namespace selector 未设置时保持现有 cluster-wide 行为；ingressClass 和每个 integration 的 ignore annotation 继续按固定版本语义过滤，已有配置仍可直接启动。
+  - id: 2
+    type: f2p
+    text: 配置接受标准 Kubernetes label selector 并在启动阶段校验；合法 selector 对 Namespace labels 给出确定匹配结果，非法表达式明确失败而不会退化为全选或全不选。
+  - id: 3
+    type: f2p
+    text: Namespace 从不匹配进入匹配时，其事件只 enqueue 该命名空间内符合现有条件的 IngressRoute，并为它们创建或修复 Certificate 和 DNSEndpoint；其他命名空间不受影响。
+  - id: 4
+    type: f2p
+    text: Namespace 明确退出 selector 时，仅删除由各当前 IngressRoute 控制的 Certificate 和 DNSEndpoint，保留无 owner 或其他 controller 拥有的同名资源；重新加入后无需修改路由即可重建。
+  - id: 5
+    type: f2p
+    text: Namespace Get、List 或 watch 的短暂错误不会触发退出清理，reconcile 返回可重试结果并保留既有 children；控制面恢复后能按真实 label 完成进入或退出收敛。
+  - id: 6
+    type: f2p
+    text: 配置 target Service 的现有 watch 仍能更新所有依赖它且当前被接管的 IngressRoute，不匹配命名空间中的路由不会因 Service 事件被重新创建派生资源。
+  - id: 7
+    type: p2p
+    text: Helm values、配置模板和 Namespace get/list/watch RBAC 与代码选项一致；现有 IngressRoute、Service、owned child 监听和 cert-manager/external-dns 回归测试保持通过。

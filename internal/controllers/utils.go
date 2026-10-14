@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -54,6 +55,7 @@ func builderWithIntegrations(
 	integrations []integrations.Integration,
 	ctrlClient client.Client,
 	logger *slog.Logger,
+	isManaged func(context.Context, client.Object) bool,
 ) *builder.Builder {
 	// Reconcile whenever an owned resource of one of the integrations is modified
 	for _, itg := range integrations {
@@ -70,6 +72,7 @@ func builderWithIntegrations(
 						return &v
 					})
 				},
+				isManaged,
 			)
 			builder = builder.Watches(
 				itg.WatchedObject(),

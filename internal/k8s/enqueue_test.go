@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestEnqueueMapFunc(t *testing.T) {
@@ -39,6 +40,7 @@ func TestEnqueueMapFunc(t *testing.T) {
 		func(list *v1.ServiceList) []client.Object {
 			return ext.Map(list.Items, func(v v1.Service) client.Object { return &v })
 		},
+		nil,
 	)
 
 	// Check whether enqueue only happens for service1
@@ -56,4 +58,48 @@ func TestEnqueueMapFunc(t *testing.T) {
 		}
 	}
 	assert.ElementsMatch(t, names, found)
+}
+
+func TestEnqueueMapFuncWithFilter(t *testing.T) {
+	// Setup
+	ctx := context.Background()
+	scheme := k8tests.NewScheme()
+	ctrlClient := k8tests.NewClient(t, scheme)
+	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
+	defer shutdown()
+
+	// Create a couple of services
+	service1 := k8tests.DummyService("my-service-1", namespace, 80)
+	err := ctrlClient.Create(ctx, &service1)
+	require.Nil(t, err)
+	service2 := k8tests.DummyService("my-service-2", namespace, 80)
+	err = ctrlClient.Create(ctx, &service2)
+	require.Nil(t, err)
+	service3 := k8tests.DummyService("my-service-3", namespace, 80)
+	err = ctrlClient.Create(ctx, &service3)
+	require.Nil(t, err)
+
+	// Only services whose name is "my-service-2" are considered managed
+	var services v1.ServiceList
+	enqueuer := EnqueueMapFunc(
+		ctrlClient, slog.Default(), &service1, &services,
+		func(list *v1.ServiceList) []client.Object {
+			return ext.Map(list.Items, func(v v1.Service) client.Object { return &v })
+		},
+		func(_ context.Context, obj client.Object) bool {
+			return obj.GetName() == "my-service-2"
+		},
+	)
+
+	// The filter must restrict the enqueued resources to managed ones
+	requests := enqueuer(ctx, &service1)
+	var inNamespace []reconcile.Request
+	for _, request := range requests {
+		if request.Namespace == namespace {
+			inNamespace = append(inNamespace, request)
+		}
+	}
+	assert.Len(t, inNamespace, 1)
+	assert.Equal(t, "my-service-2", inNamespace[0].Name)
+	assert.Equal(t, namespace, inNamespace[0].Namespace)
 }

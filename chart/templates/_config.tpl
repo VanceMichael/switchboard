@@ -12,10 +12,16 @@ metrics:
   bindAddress: :{{ .Values.metrics.port }}
 {{ end }}
 
-{{ if .Values.selector.ingressClass }}
+{{- if or .Values.selector.ingressClass .Values.selector.namespaceSelector }}
 selector:
+  {{- if .Values.selector.ingressClass }}
   ingressClass: {{ .Values.selector.ingressClass }}
-{{ end }}
+  {{- end }}
+  {{- with .Values.selector.namespaceSelector }}
+  namespaceSelector:
+    {{ toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 
 {{- $certManager := .Values.integrations.certManager -}}
 {{- $externalDNS := .Values.integrations.externalDNS -}}

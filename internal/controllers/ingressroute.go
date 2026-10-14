@@ -10,9 +10,16 @@ import (
 	"github.com/borchero/switchboard/internal/integrations"
 	"github.com/borchero/switchboard/internal/switchboard"
 	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
+	v1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 // IngressRouteReconciler reconciles an IngressRoute object.
@@ -31,10 +38,22 @@ func NewIngressRouteReconciler(
 	if err != nil {
 		return IngressRouteReconciler{}, fmt.Errorf("failed to initialize integrations: %s", err)
 	}
+
+	// Parse the optional namespace selector up-front: an invalid selector must cause startup to
+	// fail rather than being discovered on every reconcile.
+	var namespaceSelector labels.Selector
+	if config.Selector.NamespaceSelector != nil {
+		namespaceSelector, err = metav1.LabelSelectorAsSelector(config.Selector.NamespaceSelector)
+		if err != nil {
+			return IngressRouteReconciler{},
+				fmt.Errorf("invalid namespace label selector: %w", err)
+		}
+	}
+
 	return IngressRouteReconciler{
 		Client:       client,
 		logger:       logger,
-		selector:     switchboard.NewSelector(config.Selector.IngressClass),
+		selector:     switchboard.NewSelector(config.Selector.IngressClass, namespaceSelector),
 		integrations: integrations,
 	}, nil
 }
@@ -54,6 +73,35 @@ func (r *IngressRouteReconciler) Reconcile(
 			logger.Error("unable to query for ingress route", "error", err)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// If a namespace selector is configured, determine whether the ingress route's namespace is
+	// in scope. Whenever the namespace cannot be read, membership is unknown: we keep all
+	// existing derived resources in place and return a retriable error so that the next attempt
+	// converges against the actual labels once the API is available again.
+	if r.selector.RestrictsNamespaces() {
+		var namespace v1.Namespace
+		if err := r.Get(
+			ctx, types.NamespacedName{Name: ingressRoute.Namespace}, &namespace,
+		); err != nil {
+			logger.Error("unable to query namespace; membership is unknown, retrying", "error", err)
+			return ctrl.Result{}, err
+		}
+		if !r.selector.MatchesNamespace(namespace.Labels) {
+			// The namespace explicitly left the scope. We release only the derived resources
+			// that are controlled by this ingress route: same-named resources created by
+			// someone else must not be affected.
+			logger.Debug("namespace does not match selector, releasing owned resources")
+			for _, itg := range r.integrations {
+				if err := itg.DeleteResource(ctx, &ingressRoute); err != nil {
+					logger.Error("failed to release owned resource",
+						"integration", itg.Name(), "error", err,
+					)
+					return ctrl.Result{}, err
+				}
+			}
+			return ctrl.Result{}, nil
+		}
 	}
 
 	// Then, we check if the resource should be processed
@@ -101,7 +149,17 @@ func (r *IngressRouteReconciler) Reconcile(
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	builder := ctrl.NewControllerManagedBy(mgr).For(&traefik.IngressRoute{})
-	builder = builderWithIntegrations(builder, r.integrations, r, r.logger)
-	return builder.Complete(r)
+	bld := ctrl.NewControllerManagedBy(mgr).For(&traefik.IngressRoute{})
+	bld = builderWithIntegrations(bld, r.integrations, r, r.logger, r.isManagedRoute)
+	// When a namespace selector is configured, watch namespace labels so that taking over or
+	// releasing a namespace re-reconciles its ingress routes. Only label changes (and initial
+	// discoveries) are relevant.
+	if r.selector.RestrictsNamespaces() {
+		bld = bld.Watches(
+			&v1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueIngressRoutesInNamespace),
+			builder.WithPredicates(predicate.LabelChangedPredicate{}),
+		)
+	}
+	return bld.Complete(r)
 }

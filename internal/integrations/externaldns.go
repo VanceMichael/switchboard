@@ -88,6 +88,14 @@ func (e *externalDNS) UpdateResource(
 	return nil
 }
 
+func (e *externalDNS) DeleteResource(ctx context.Context, owner metav1.Object) error {
+	dnsEndpoint := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
+	if err := k8s.DeleteIfOwned(ctx, e.client, &dnsEndpoint, owner); err != nil {
+		return fmt.Errorf("failed to delete DNS endpoint: %w", err)
+	}
+	return nil
+}
+
 //-------------------------------------------------------------------------------------------------
 // UTILS
 //-------------------------------------------------------------------------------------------------

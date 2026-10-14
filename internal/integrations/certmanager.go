@@ -72,6 +72,14 @@ func (c *certManager) UpdateResource(
 	return nil
 }
 
+func (c *certManager) DeleteResource(ctx context.Context, owner metav1.Object) error {
+	certificate := certmanager.Certificate{ObjectMeta: c.objectMeta(owner)}
+	if err := k8s.DeleteIfOwned(ctx, c.client, &certificate, owner); err != nil {
+		return fmt.Errorf("failed to delete TLS certificate: %w", err)
+	}
+	return nil
+}
+
 //-------------------------------------------------------------------------------------------------
 // UTILS
 //-------------------------------------------------------------------------------------------------

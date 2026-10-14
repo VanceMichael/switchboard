@@ -1,6 +1,10 @@
 package switchboard
 
-import "strings"
+import (
+	"strings"
+
+	"k8s.io/apimachinery/pkg/labels"
+)
 
 const (
 	ingressAnnotationKey = "kubernetes.io/ingress.class"
@@ -10,12 +14,31 @@ const (
 // Selector allows to easily determine if a resource with a set of annotations should be processed.
 type Selector struct {
 	ingressClass *string
+	// namespaceSelector optionally restricts processing to namespaces matching the selector. If
+	// it is nil, all namespaces are in scope (cluster-wide operation).
+	namespaceSelector labels.Selector
 }
 
 // NewSelector creates a new selector which selects resources with the
-// `kubernetes.io/ingress.class` set to the specified value if it is not `nil`.
-func NewSelector(ingressClass *string) Selector {
-	return Selector{ingressClass}
+// `kubernetes.io/ingress.class` set to the specified value if it is not `nil`. If
+// `namespaceSelector` is not nil, only resources in namespaces matching the selector are in
+// scope.
+func NewSelector(ingressClass *string, namespaceSelector labels.Selector) Selector {
+	return Selector{ingressClass, namespaceSelector}
+}
+
+// RestrictsNamespaces returns whether the selector limits processing to a subset of namespaces.
+func (s Selector) RestrictsNamespaces() bool {
+	return s.namespaceSelector != nil
+}
+
+// MatchesNamespace determines whether the provided set of namespace labels matches the selector.
+// If no namespace selector is configured, every namespace matches.
+func (s Selector) MatchesNamespace(namespaceLabels map[string]string) bool {
+	if s.namespaceSelector == nil {
+		return true
+	}
+	return s.namespaceSelector.Matches(labels.Set(namespaceLabels))
 }
 
 // Matches determines whether the provided set of annotation match the selector. If the method

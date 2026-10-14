@@ -179,6 +179,72 @@ func TestIngressHeader(t *testing.T) {
 	})
 }
 
+func TestIngressNamespaceSelector(t *testing.T) {
+	// Setup
+	ctx := context.Background()
+	scheme := k8tests.NewScheme()
+	ctrlClient := k8tests.NewClient(t, scheme)
+	namespace, shutdown := k8tests.NewNamespace(ctx, t, ctrlClient)
+	defer shutdown()
+
+	service := k8tests.DummyService("traefik", namespace, 80)
+	require.Nil(t, ctrlClient.Create(ctx, &service))
+
+	ingress := traefik.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-ingress"},
+		Spec: traefik.IngressRouteSpec{
+			Routes: []traefik.Route{{
+				Kind:  "Rule",
+				Match: "Host(`www.example.com`)",
+				Services: []traefik.Service{{
+					LoadBalancerSpec: traefik.LoadBalancerSpec{Name: "nginx"},
+				}},
+			}},
+			TLS: &traefik.TLS{SecretName: "www-tls-certificate"},
+		},
+	}
+	ingress.Namespace = namespace
+	require.Nil(t, ctrlClient.Create(ctx, &ingress))
+
+	enabledLabels := map[string]string{namespaceLabelKey: "enabled"}
+	config := createConfig(&service)
+	config.Selector.NamespaceSelector = &metav1.LabelSelector{MatchLabels: enabledLabels}
+
+	certificateKey := types.NamespacedName{Name: "my-ingress-tls", Namespace: namespace}
+	endpointKey := types.NamespacedName{Name: "my-ingress", Namespace: namespace}
+
+	// 1) The unlabeled namespace is out of scope: no derived resources are created.
+	runReconciliation(ctx, t, ctrlClient, ingress, config)
+	var certificate certmanager.Certificate
+	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, certificateKey, &certificate)))
+	var dnsEndpoint externaldnsv1alpha1.DNSEndpoint
+	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, endpointKey, &dnsEndpoint)))
+
+	// 2) Labeling the namespace takes the ingress route over.
+	setNamespaceLabels(ctx, t, ctrlClient, namespace, enabledLabels)
+	runReconciliation(ctx, t, ctrlClient, ingress, config)
+	require.Nil(t, ctrlClient.Get(ctx, certificateKey, &certificate))
+	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &dnsEndpoint))
+	var managed traefik.IngressRoute
+	require.Nil(t, ctrlClient.Get(ctx,
+		types.NamespacedName{Name: ingress.Name, Namespace: namespace}, &managed,
+	))
+	assert.True(t, metav1.IsControlledBy(&certificate, &managed))
+	assert.True(t, metav1.IsControlledBy(&dnsEndpoint, &managed))
+
+	// 3) Removing the label releases only the owned derived resources.
+	setNamespaceLabels(ctx, t, ctrlClient, namespace, map[string]string{})
+	runReconciliation(ctx, t, ctrlClient, ingress, config)
+	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, certificateKey, &certificate)))
+	assert.True(t, apierrors.IsNotFound(ctrlClient.Get(ctx, endpointKey, &dnsEndpoint)))
+
+	// 4) Re-adding the label rebuilds the derived resources.
+	setNamespaceLabels(ctx, t, ctrlClient, namespace, enabledLabels)
+	runReconciliation(ctx, t, ctrlClient, ingress, config)
+	require.Nil(t, ctrlClient.Get(ctx, certificateKey, &certificate))
+	require.Nil(t, ctrlClient.Get(ctx, endpointKey, &dnsEndpoint))
+}
+
 //-------------------------------------------------------------------------------------------------
 // TESTING UTILITIES
 //-------------------------------------------------------------------------------------------------
@@ -186,6 +252,15 @@ func TestIngressHeader(t *testing.T) {
 type testCase struct {
 	Ingress  traefik.IngressRoute
 	DNSNames []string
+}
+
+func setNamespaceLabels(
+	ctx context.Context, t *testing.T, ctrlClient client.Client, name string, labels map[string]string,
+) {
+	var namespace v1.Namespace
+	require.Nil(t, ctrlClient.Get(ctx, types.NamespacedName{Name: name}, &namespace))
+	namespace.Labels = labels
+	require.Nil(t, ctrlClient.Update(ctx, &namespace))
 }
 
 func runTest(t *testing.T, test testCase) {
