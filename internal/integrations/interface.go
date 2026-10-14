@@ -35,6 +35,13 @@ type Integration interface {
 	// set set). If the integration does not watch any resources, this method may return `nil`.
 	WatchedObject() client.Object
 
+	// IngressRouteNameForResource maps the name of a child resource back to the name of the
+	// IngressRoute whose preferred child carries that name. The second return value reports
+	// whether the resource name matches the preferred-name pattern at all. It is used to enqueue
+	// precisely the single IngressRoute that is affected by an update or deletion of a foreign
+	// resource occupying its preferred name.
+	IngressRouteNameForResource(resourceName string) (ingressRouteName string, ok bool)
+
 	// UpdateResource updates the resource that ought to be owned by the passed object. Updating
 	// may entail creating the resource, updating an existing resource, or deleting the resouce.
 	// All information the generated resource is derived from the integration's global

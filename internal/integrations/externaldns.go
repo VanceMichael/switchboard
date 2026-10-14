@@ -5,12 +5,10 @@ import (
 	"fmt"
 
 	"github.com/asaskevich/govalidator"
-	"github.com/borchero/switchboard/internal/k8s"
 	"github.com/borchero/switchboard/internal/switchboard"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	externaldnsv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
 	"sigs.k8s.io/external-dns/endpoint"
 )
@@ -52,38 +50,49 @@ func (e *externalDNS) WatchedObject() client.Object {
 	}
 }
 
+func (*externalDNS) IngressRouteNameForResource(resourceName string) (string, bool) {
+	// The preferred DNSEndpoint name is identical to the IngressRoute name. Whether an
+	// IngressRoute of that name exists is verified by the enqueue mapper via a lookup.
+	return resourceName, true
+}
+
 func (e *externalDNS) UpdateResource(
 	ctx context.Context, owner metav1.Object, info IngressInfo,
 ) error {
-	// If the ingress specifies no hosts, there should be no endpoint. We try deleting it and
-	// ignore any error if it was not found.
-	if len(info.Hosts) == 0 {
-		dnsEndpoint := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
-		if err := k8s.DeleteIfFound(ctx, e.client, &dnsEndpoint); err != nil {
-			return fmt.Errorf("failed to delete DNS endpoint: %w", err)
+	// If the ingress specifies no hosts, there should be no endpoint.
+	want := len(info.Hosts) > 0
+
+	var targets []string
+	if want {
+		var err error
+		targets, err = e.target.Targets(ctx, e.client)
+		if err != nil {
+			return fmt.Errorf("failed to query IP for DNS A record: %w", err)
 		}
-		return nil
 	}
 
-	// Get the IPs of the target service
-	targets, err := e.target.Targets(ctx, e.client)
-	if err != nil {
-		return fmt.Errorf("failed to query IP for DNS A record: %w", err)
-	}
+	mutate := func(raw client.Object) error {
+		resource := raw.(*externaldnsv1alpha1.DNSEndpoint)
 
-	// Create the endpoint resource
-	resource := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
-	if _, err := controllerutil.CreateOrPatch(ctx, e.client, &resource, func() error {
+		// Preserve the historical behavior: newly created endpoints inherit the annotations of
+		// the owner.
+		if resource.GetResourceVersion() == "" {
+			resource.SetAnnotations(cloneAnnotations(owner.GetAnnotations()))
+		}
+
 		// Meta
-		if err := reconcileMetadata(owner, &resource, e.client.Scheme()); err != nil {
-			return nil
+		if err := reconcileMetadata(owner, resource, e.client.Scheme()); err != nil {
+			return fmt.Errorf("failed to reconcile metadata: %w", err)
 		}
 
 		// Spec
 		resource.Spec.Endpoints = e.endpoints(info.Hosts, targets)
 		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to upsert DNS endpoint: %w", err)
+	}
+
+	children := e.children()
+	if err := children.reconcile(ctx, owner, owner.GetName(), want, mutate); err != nil {
+		return fmt.Errorf("external-dns: %w", err)
 	}
 	return nil
 }
@@ -92,11 +101,29 @@ func (e *externalDNS) UpdateResource(
 // UTILS
 //-------------------------------------------------------------------------------------------------
 
-func (*externalDNS) objectMeta(owner metav1.Object) metav1.ObjectMeta {
-	return metav1.ObjectMeta{
-		Name:        owner.GetName(),
-		Namespace:   owner.GetNamespace(),
-		Annotations: owner.GetAnnotations(),
+func (e *externalDNS) children() childResources {
+	return childResources{
+		client: e.client,
+		scheme: e.client.Scheme(),
+		newObject: func(namespace, name string) client.Object {
+			return &externaldnsv1alpha1.DNSEndpoint{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+				},
+			}
+		},
+		newList: func() client.ObjectList {
+			return &externaldnsv1alpha1.DNSEndpointList{}
+		},
+		listItems: func(list client.ObjectList) []client.Object {
+			items := list.(*externaldnsv1alpha1.DNSEndpointList).Items
+			result := make([]client.Object, len(items))
+			for i := range items {
+				result[i] = &items[i]
+			}
+			return result
+		},
 	}
 }
 

@@ -60,6 +60,20 @@ func builderWithIntegrations(
 		builder = builder.Owns(itg.OwnedResource())
 	}
 
+	// Also watch child resources that are not owned by us: a foreign resource may occupy an
+	// IngressRoute's preferred child name. Only the single IngressRoute whose preferred name
+	// matches the event object is enqueued - unrelated foreign resources cause no reconciliation.
+	for _, itg := range integrations {
+		enqueue := k8s.EnqueuePreferredOwnerFunc(logger, ctrlClient,
+			func() client.Object { return &traefik.IngressRoute{} },
+			itg.IngressRouteNameForResource,
+		)
+		builder = builder.Watches(
+			itg.OwnedResource(),
+			handler.EnqueueRequestsFromMapFunc(enqueue),
+		)
+	}
+
 	// Watch for dependent resources if required
 	for _, itg := range integrations {
 		if itg.WatchedObject() != nil {

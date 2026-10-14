@@ -1,0 +1,1283 @@
+diff --git a/internal/controllers/utils.go b/internal/controllers/utils.go
+index d53288e..d04a8b8 100644
+--- a/internal/controllers/utils.go
++++ b/internal/controllers/utils.go
+@@ -60,6 +60,20 @@ func builderWithIntegrations(
+ 		builder = builder.Owns(itg.OwnedResource())
+ 	}
+ 
++	// Also watch child resources that are not owned by us: a foreign resource may occupy an
++	// IngressRoute's preferred child name. Only the single IngressRoute whose preferred name
++	// matches the event object is enqueued - unrelated foreign resources cause no reconciliation.
++	for _, itg := range integrations {
++		enqueue := k8s.EnqueuePreferredOwnerFunc(logger, ctrlClient,
++			func() client.Object { return &traefik.IngressRoute{} },
++			itg.IngressRouteNameForResource,
++		)
++		builder = builder.Watches(
++			itg.OwnedResource(),
++			handler.EnqueueRequestsFromMapFunc(enqueue),
++		)
++	}
++
+ 	// Watch for dependent resources if required
+ 	for _, itg := range integrations {
+ 		if itg.WatchedObject() != nil {
+diff --git a/internal/integrations/certmanager.go b/internal/integrations/certmanager.go
+index b4e52de..cf43c0b 100644
+--- a/internal/integrations/certmanager.go
++++ b/internal/integrations/certmanager.go
+@@ -3,15 +3,18 @@ package integrations
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	"dario.cat/mergo"
+-	"github.com/borchero/switchboard/internal/k8s"
+ 	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+ )
+ 
++// certificateNameSuffix is appended to the IngressRoute name to derive the preferred
++// certificate name.
++const certificateNameSuffix = "-tls"
++
+ type certManager struct {
+ 	client   client.Client
+ 	template certmanager.Certificate
+@@ -35,39 +38,50 @@ func (*certManager) WatchedObject() client.Object {
+ 	return nil
+ }
+ 
++func (*certManager) IngressRouteNameForResource(resourceName string) (string, bool) {
++	if !strings.HasSuffix(resourceName, certificateNameSuffix) {
++		return "", false
++	}
++	return strings.TrimSuffix(resourceName, certificateNameSuffix), true
++}
++
+ func (c *certManager) UpdateResource(
+ 	ctx context.Context, owner metav1.Object, info IngressInfo,
+ ) error {
+ 	// If the ingress does not specify a TLS secret name or specifies no hosts, no certificate
+ 	// needs to be created.
+-	if info.TLSSecretName == nil || len(info.Hosts) == 0 {
+-		certificate := certmanager.Certificate{ObjectMeta: c.objectMeta(owner)}
+-		if err := k8s.DeleteIfFound(ctx, c.client, &certificate); err != nil {
+-			return fmt.Errorf("failed to delete TLS certificate: %w", err)
+-		}
+-		return nil
++	want := info.TLSSecretName != nil && len(info.Hosts) > 0
++
++	tlsSecretName := ""
++	if info.TLSSecretName != nil {
++		tlsSecretName = *info.TLSSecretName
+ 	}
+ 
+-	// Otherwise, we can create the certificate resource
+-	resource := certmanager.Certificate{ObjectMeta: c.objectMeta(owner)}
+-	if _, err := controllerutil.CreateOrPatch(ctx, c.client, &resource, func() error {
++	mutate := func(raw client.Object) error {
++		resource := raw.(*certmanager.Certificate)
++
+ 		// Meta
+ 		if err := reconcileMetadata(
+-			owner, &resource, c.client.Scheme(), &c.template.ObjectMeta,
++			owner, resource, c.client.Scheme(), &c.template.ObjectMeta,
+ 		); err != nil {
+-			return fmt.Errorf("failed to reconcile metadata: %s", err)
++			return fmt.Errorf("failed to reconcile metadata: %w", err)
+ 		}
+ 
+ 		// Spec
+ 		template := c.template.Spec.DeepCopy()
+-		template.SecretName = *info.TLSSecretName
++		template.SecretName = tlsSecretName
+ 		template.DNSNames = info.Hosts
+ 		if err := mergo.Merge(&resource.Spec, template, mergo.WithOverride); err != nil {
+-			return fmt.Errorf("failed to reconcile specification: %s", err)
++			return fmt.Errorf("failed to reconcile specification: %w", err)
+ 		}
+ 		return nil
+-	}); err != nil {
+-		return fmt.Errorf("failed to upsert TLS certificate: %w", err)
++	}
++
++	children := c.children()
++	if err := children.reconcile(
++		ctx, owner, c.preferredName(owner), want, mutate,
++	); err != nil {
++		return fmt.Errorf("cert-manager: %w", err)
+ 	}
+ 	return nil
+ }
+@@ -76,9 +90,32 @@ func (c *certManager) UpdateResource(
+ // UTILS
+ //-------------------------------------------------------------------------------------------------
+ 
+-func (*certManager) objectMeta(parent metav1.Object) metav1.ObjectMeta {
+-	return metav1.ObjectMeta{
+-		Name:      fmt.Sprintf("%s-tls", parent.GetName()),
+-		Namespace: parent.GetNamespace(),
++func (*certManager) preferredName(owner metav1.Object) string {
++	return fmt.Sprintf("%s%s", owner.GetName(), certificateNameSuffix)
++}
++
++func (c *certManager) children() childResources {
++	return childResources{
++		client: c.client,
++		scheme: c.client.Scheme(),
++		newObject: func(namespace, name string) client.Object {
++			return &certmanager.Certificate{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      name,
++					Namespace: namespace,
++				},
++			}
++		},
++		newList: func() client.ObjectList {
++			return &certmanager.CertificateList{}
++		},
++		listItems: func(list client.ObjectList) []client.Object {
++			items := list.(*certmanager.CertificateList).Items
++			result := make([]client.Object, len(items))
++			for i := range items {
++				result[i] = &items[i]
++			}
++			return result
++		},
+ 	}
+ }
+diff --git a/internal/integrations/externaldns.go b/internal/integrations/externaldns.go
+index f25468a..616f9e4 100644
+--- a/internal/integrations/externaldns.go
++++ b/internal/integrations/externaldns.go
+@@ -5,12 +5,10 @@ import (
+ 	"fmt"
+ 
+ 	"github.com/asaskevich/govalidator"
+-	"github.com/borchero/switchboard/internal/k8s"
+ 	"github.com/borchero/switchboard/internal/switchboard"
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+ 	externaldnsv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
+ 	"sigs.k8s.io/external-dns/endpoint"
+ )
+@@ -52,38 +50,49 @@ func (e *externalDNS) WatchedObject() client.Object {
+ 	}
+ }
+ 
++func (*externalDNS) IngressRouteNameForResource(resourceName string) (string, bool) {
++	// The preferred DNSEndpoint name is identical to the IngressRoute name. Whether an
++	// IngressRoute of that name exists is verified by the enqueue mapper via a lookup.
++	return resourceName, true
++}
++
+ func (e *externalDNS) UpdateResource(
+ 	ctx context.Context, owner metav1.Object, info IngressInfo,
+ ) error {
+-	// If the ingress specifies no hosts, there should be no endpoint. We try deleting it and
+-	// ignore any error if it was not found.
+-	if len(info.Hosts) == 0 {
+-		dnsEndpoint := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
+-		if err := k8s.DeleteIfFound(ctx, e.client, &dnsEndpoint); err != nil {
+-			return fmt.Errorf("failed to delete DNS endpoint: %w", err)
++	// If the ingress specifies no hosts, there should be no endpoint.
++	want := len(info.Hosts) > 0
++
++	var targets []string
++	if want {
++		var err error
++		targets, err = e.target.Targets(ctx, e.client)
++		if err != nil {
++			return fmt.Errorf("failed to query IP for DNS A record: %w", err)
+ 		}
+-		return nil
+ 	}
+ 
+-	// Get the IPs of the target service
+-	targets, err := e.target.Targets(ctx, e.client)
+-	if err != nil {
+-		return fmt.Errorf("failed to query IP for DNS A record: %w", err)
+-	}
++	mutate := func(raw client.Object) error {
++		resource := raw.(*externaldnsv1alpha1.DNSEndpoint)
++
++		// Preserve the historical behavior: newly created endpoints inherit the annotations of
++		// the owner.
++		if resource.GetResourceVersion() == "" {
++			resource.SetAnnotations(cloneAnnotations(owner.GetAnnotations()))
++		}
+ 
+-	// Create the endpoint resource
+-	resource := externaldnsv1alpha1.DNSEndpoint{ObjectMeta: e.objectMeta(owner)}
+-	if _, err := controllerutil.CreateOrPatch(ctx, e.client, &resource, func() error {
+ 		// Meta
+-		if err := reconcileMetadata(owner, &resource, e.client.Scheme()); err != nil {
+-			return nil
++		if err := reconcileMetadata(owner, resource, e.client.Scheme()); err != nil {
++			return fmt.Errorf("failed to reconcile metadata: %w", err)
+ 		}
+ 
+ 		// Spec
+ 		resource.Spec.Endpoints = e.endpoints(info.Hosts, targets)
+ 		return nil
+-	}); err != nil {
+-		return fmt.Errorf("failed to upsert DNS endpoint: %w", err)
++	}
++
++	children := e.children()
++	if err := children.reconcile(ctx, owner, owner.GetName(), want, mutate); err != nil {
++		return fmt.Errorf("external-dns: %w", err)
+ 	}
+ 	return nil
+ }
+@@ -92,11 +101,29 @@ func (e *externalDNS) UpdateResource(
+ // UTILS
+ //-------------------------------------------------------------------------------------------------
+ 
+-func (*externalDNS) objectMeta(owner metav1.Object) metav1.ObjectMeta {
+-	return metav1.ObjectMeta{
+-		Name:        owner.GetName(),
+-		Namespace:   owner.GetNamespace(),
+-		Annotations: owner.GetAnnotations(),
++func (e *externalDNS) children() childResources {
++	return childResources{
++		client: e.client,
++		scheme: e.client.Scheme(),
++		newObject: func(namespace, name string) client.Object {
++			return &externaldnsv1alpha1.DNSEndpoint{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      name,
++					Namespace: namespace,
++				},
++			}
++		},
++		newList: func() client.ObjectList {
++			return &externaldnsv1alpha1.DNSEndpointList{}
++		},
++		listItems: func(list client.ObjectList) []client.Object {
++			items := list.(*externaldnsv1alpha1.DNSEndpointList).Items
++			result := make([]client.Object, len(items))
++			for i := range items {
++				result[i] = &items[i]
++			}
++			return result
++		},
+ 	}
+ }
+ 
+diff --git a/internal/integrations/interface.go b/internal/integrations/interface.go
+index 1cdafca..eee587b 100644
+--- a/internal/integrations/interface.go
++++ b/internal/integrations/interface.go
+@@ -35,6 +35,13 @@ type Integration interface {
+ 	// set set). If the integration does not watch any resources, this method may return `nil`.
+ 	WatchedObject() client.Object
+ 
++	// IngressRouteNameForResource maps the name of a child resource back to the name of the
++	// IngressRoute whose preferred child carries that name. The second return value reports
++	// whether the resource name matches the preferred-name pattern at all. It is used to enqueue
++	// precisely the single IngressRoute that is affected by an update or deletion of a foreign
++	// resource occupying its preferred name.
++	IngressRouteNameForResource(resourceName string) (ingressRouteName string, ok bool)
++
+ 	// UpdateResource updates the resource that ought to be owned by the passed object. Updating
+ 	// may entail creating the resource, updating an existing resource, or deleting the resouce.
+ 	// All information the generated resource is derived from the integration's global
+diff --git a/internal/integrations/ownership_test.go b/internal/integrations/ownership_test.go
+new file mode 100644
+index 0000000..f222672
+--- /dev/null
++++ b/internal/integrations/ownership_test.go
+@@ -0,0 +1,588 @@
++package integrations
++
++import (
++	"context"
++	"regexp"
++	"testing"
++
++	"github.com/borchero/switchboard/internal/k8tests"
++	"github.com/borchero/switchboard/internal/switchboard"
++	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
++	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	externaldnsv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
++)
++
++const ownershipTestNamespace = "ownership-test"
++
++// dns1123Subdomain matches legal Kubernetes resource names (RFC 1123 subdomain).
++var dns1123Subdomain = regexp.MustCompile(
++	`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`,
++)
++
++//-------------------------------------------------------------------------------------------------
++// PURE HELPERS
++//-------------------------------------------------------------------------------------------------
++
++func TestAlternativeName(t *testing.T) {
++	preferred := "my-ingress-tls"
++	uid := types.UID("owner-uid-1")
++
++	// Deterministic and stable
++	alt1 := AlternativeName(preferred, uid)
++	assert.Equal(t, alt1, AlternativeName(preferred, uid))
++
++	// Legal name and bounded length
++	assert.Regexp(t, dns1123Subdomain, alt1)
++	assert.LessOrEqual(t, len(alt1), resourceNameMaxLength)
++
++	// Distinct UIDs (e.g. a recreated same-named owner) map to distinct alternatives
++	assert.NotEqual(t, alt1, AlternativeName(preferred, types.UID("owner-uid-2")))
++
++	// The alternative must not itself match the preferred-name pattern used for certificates
++	// (it ends with the UID hash, not with "-tls").
++	assert.False(t, hasSuffix(alt1, certificateNameSuffix))
++
++	// Long preferred names are truncated into a legal alternative
++	altLong := AlternativeName(repeat("a", 300)+certificateNameSuffix, uid)
++	assert.LessOrEqual(t, len(altLong), resourceNameMaxLength)
++	assert.Regexp(t, dns1123Subdomain, altLong)
++
++	// Trailing dashes are absorbed so the suffix separator is legal
++	assert.Regexp(t, dns1123Subdomain, AlternativeName("dash-", uid))
++}
++
++func TestControlledByPredicate(t *testing.T) {
++	// No controller reference at all
++	unowned := k8tests.DummyService("other", ownershipTestNamespace, 80)
++	assert.False(t, controlledBy(&unowned, "Service", "my-ingress", "uid-1"))
++
++	// Matching controller reference
++	owned := k8tests.DummyService("child", ownershipTestNamespace, 80)
++	owned.OwnerReferences = []metav1.OwnerReference{
++		controllerRef("Service", "v1", "my-ingress", "uid-1"),
++	}
++	assert.True(t, controlledBy(&owned, "Service", "my-ingress", "uid-1"))
++
++	// Another controller kind
++	foreign := owned.DeepCopy()
++	foreign.OwnerReferences = []metav1.OwnerReference{
++		controllerRef("Deployment", "apps/v1", "my-ingress", "uid-1"),
++	}
++	assert.False(t, controlledBy(foreign, "Service", "my-ingress", "uid-1"))
++
++	// Stale UID: same kind and name but a different UID (owner recreated)
++	stale := owned.DeepCopy()
++	stale.OwnerReferences = []metav1.OwnerReference{
++		controllerRef("Service", "v1", "my-ingress", "uid-stale"),
++	}
++	assert.False(t, controlledBy(stale, "Service", "my-ingress", "uid-1"))
++
++	// A non-controller reference does not establish ownership
++	ref := controllerRef("Service", "v1", "my-ingress", "uid-1")
++	ref.Controller = nil
++	weak := k8tests.DummyService("child", ownershipTestNamespace, 80)
++	weak.OwnerReferences = []metav1.OwnerReference{ref}
++	assert.False(t, controlledBy(&weak, "Service", "my-ingress", "uid-1"))
++}
++
++func TestIngressRouteNameForResource(t *testing.T) {
++	cert := NewCertManager(nil, certmanager.Certificate{}).(*certManager)
++	name, ok := cert.IngressRouteNameForResource("my-ingress-tls")
++	assert.True(t, ok)
++	assert.Equal(t, "my-ingress", name)
++	_, ok = cert.IngressRouteNameForResource("my-ingress")
++	assert.False(t, ok)
++	// UID-hash alternative names do not invert to a route
++	_, ok = cert.IngressRouteNameForResource(
++		AlternativeName("my-ingress-tls", types.UID("uid-1")),
++	)
++	assert.False(t, ok)
++
++	dns := NewExternalDNS(nil, switchboard.NewStaticTarget(), nil).(*externalDNS)
++	name, ok = dns.IngressRouteNameForResource("my-ingress")
++	assert.True(t, ok)
++	assert.Equal(t, "my-ingress", name)
++}
++
++//-------------------------------------------------------------------------------------------------
++// CERTIFICATE INTEGRATION
++//-------------------------------------------------------------------------------------------------
++
++func TestCertPreferredLifecycleWithoutConflict(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(map[string]string{"team": "platform"})
++	cl := newOwnershipFakeClient(owner)
++	integration := certIntegration(cl)
++
++	// Create at the preferred name
++	require.Nil(t, integration.UpdateResource(ctx, owner, certInfo()))
++	cert := mustGetCert(t, ctx, cl, "my-ingress-tls")
++	assert.Equal(t, []metav1.OwnerReference{
++		controllerRef("Service", "v1", "my-ingress", "owner-uid-1"),
++	}, cert.OwnerReferences)
++	assert.Equal(t, "switchboard", cert.Labels[managedByLabelKey])
++	assert.Equal(t, "tls-secret", cert.Spec.SecretName)
++	assert.Equal(t, []string{"example.com"}, cert.Spec.DNSNames)
++	assert.Len(t, listCerts(ctx, t, cl), 1)
++
++	// Update patches in place
++	info := certInfo()
++	info.Hosts = []string{"example.com", "www.example.com"}
++	require.Nil(t, integration.UpdateResource(ctx, owner, info))
++	cert = mustGetCert(t, ctx, cl, "my-ingress-tls")
++	assert.ElementsMatch(t, info.Hosts, cert.Spec.DNSNames)
++	assert.Len(t, listCerts(ctx, t, cl), 1)
++
++	// Cleanup removes the owned child
++	require.Nil(t, integration.UpdateResource(ctx, owner, IngressInfo{}))
++	assert.True(t, certNotFound(ctx, t, cl, "my-ingress-tls"))
++}
++
++func TestCertForeignPreferredUsesStableAlternative(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(nil)
++	cl := newOwnershipFakeClient(owner)
++
++	// Platform team pre-reserves the preferred name without a controller reference.
++	foreign := &certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: ownershipTestNamespace,
++			Labels:    map[string]string{"owner": "platform"},
++		},
++		Spec: certmanager.CertificateSpec{SecretName: "handcrafted"},
++	}
++	require.Nil(t, cl.Create(ctx, foreign))
++
++	integration := certIntegration(cl)
++	require.Nil(t, integration.UpdateResource(ctx, owner, certInfo()))
++
++	certs := listCerts(ctx, t, cl)
++	require.Len(t, certs, 2)
++
++	// Foreign object is preserved untouched.
++	preserved := mustGetCert(t, ctx, cl, "my-ingress-tls")
++	assert.Equal(t, map[string]string{"owner": "platform"}, preserved.Labels)
++	assert.Empty(t, preserved.OwnerReferences)
++	assert.Equal(t, "handcrafted", preserved.Spec.SecretName)
++
++	// Our certificate lives at the deterministic alternative name.
++	altName := AlternativeName("my-ingress-tls", owner.UID)
++	alt := mustGetCert(t, ctx, cl, altName)
++	assert.Equal(t, []metav1.OwnerReference{
++		controllerRef("Service", "v1", "my-ingress", "owner-uid-1"),
++	}, alt.OwnerReferences)
++	assert.Equal(t, "switchboard", alt.Labels[managedByLabelKey])
++	assert.Equal(t, "tls-secret", alt.Spec.SecretName)
++
++	// Reconciling again is stable: same alternative name, no extras.
++	require.Nil(t, integration.UpdateResource(ctx, owner, certInfo()))
++	assert.Len(t, listCerts(ctx, t, cl), 2)
++	assert.False(t, certNotFound(ctx, t, cl, altName))
++}
++
++func TestCertForeignControllersAndStaleUID(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(nil)
++	cl := newOwnershipFakeClient(owner)
++
++	// Another controller occupies the preferred name.
++	other := &certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: ownershipTestNamespace,
++			OwnerReferences: []metav1.OwnerReference{
++				controllerRef("Deployment", "apps/v1", "someone-else", "other-uid"),
++			},
++		},
++	}
++	require.Nil(t, cl.Create(ctx, other))
++	integration := certIntegration(cl)
++	require.Nil(t, integration.UpdateResource(ctx, owner, certInfo()))
++
++	altName := AlternativeName("my-ingress-tls", owner.UID)
++	assert.False(t, certNotFound(ctx, t, cl, altName))
++	preserved := mustGetCert(t, ctx, cl, "my-ingress-tls")
++	require.Len(t, preserved.OwnerReferences, 1)
++	assert.Equal(t, "Deployment", preserved.OwnerReferences[0].Kind)
++
++	// Stale UID: same kind/name but a previous incarnation of the owner.
++	require.Nil(t, cl.Delete(ctx, other))
++	stale := &certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: ownershipTestNamespace,
++			OwnerReferences: []metav1.OwnerReference{
++				controllerRef("Service", "v1", "my-ingress", "owner-uid-stale"),
++			},
++		},
++	}
++	require.Nil(t, cl.Create(ctx, stale))
++	require.Nil(t, integration.UpdateResource(ctx, owner, certInfo()))
++	assert.False(t, certNotFound(ctx, t, cl, altName))
++	assert.Equal(t,
++		types.UID("owner-uid-stale"),
++		mustGetCert(t, ctx, cl, "my-ingress-tls").OwnerReferences[0].UID,
++	)
++}
++
++func TestCertMigrationBackToPreferred(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(nil)
++	cl := newOwnershipFakeClient(owner)
++	altName := AlternativeName("my-ingress-tls", owner.UID)
++
++	// Start with a foreign reservation and reconcile into the alternative.
++	foreign := &certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: ownershipTestNamespace,
++		},
++	}
++	require.Nil(t, cl.Create(ctx, foreign))
++	require.Nil(t, certIntegration(cl).UpdateResource(ctx, owner, certInfo()))
++	assert.False(t, certNotFound(ctx, t, cl, altName))
++
++	// The preferred name frees up: the preferred child must be created before the alternative
++	// is deleted.
++	require.Nil(t, cl.Delete(ctx, foreign))
++	var ops []string
++	tracking := &opTrackingClient{Client: cl, ops: &ops}
++	require.Nil(t, certIntegration(tracking).UpdateResource(ctx, owner, certInfo()))
++
++	createIdx := indexOf(ops, "create:my-ingress-tls")
++	deleteIdx := indexOf(ops, "delete:"+altName)
++	require.GreaterOrEqual(t, createIdx, 0)
++	require.GreaterOrEqual(t, deleteIdx, 0)
++	assert.Less(t, createIdx, deleteIdx, "preferred must be created before alternative is deleted")
++
++	migrated := mustGetCert(t, ctx, cl, "my-ingress-tls")
++	assert.Equal(t, owner.UID, migrated.OwnerReferences[0].UID)
++	assert.Equal(t, "tls-secret", migrated.Spec.SecretName)
++	assert.True(t, certNotFound(ctx, t, cl, altName))
++	assert.Len(t, listCerts(ctx, t, cl), 1)
++}
++
++func TestCertPreferredFailureKeepsAlternative(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(nil)
++	cl := newOwnershipFakeClient(owner)
++	altName := AlternativeName("my-ingress-tls", owner.UID)
++
++	// Occupy the preferred name and reconcile into the alternative.
++	foreign := &certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: ownershipTestNamespace,
++		},
++	}
++	require.Nil(t, cl.Create(ctx, foreign))
++	require.Nil(t, certIntegration(cl).UpdateResource(ctx, owner, certInfo()))
++
++	// The preferred name frees up, but creating it now fails: the alternative must remain in
++	// place and the returned error must be retryable.
++	require.Nil(t, cl.Delete(ctx, foreign))
++	failing := &createFailingClient{
++		Client: cl,
++		groupResource: schema.GroupResource{
++			Group: "cert-manager.io", Resource: "certificates",
++		},
++		failName: "my-ingress-tls",
++	}
++	err := certIntegration(failing).UpdateResource(ctx, owner, certInfo())
++	require.Error(t, err)
++	assert.True(t, apierrors.IsAlreadyExists(err))
++
++	alt := mustGetCert(t, ctx, cl, altName)
++	assert.Equal(t, owner.UID, alt.OwnerReferences[0].UID)
++	assert.Equal(t, "tls-secret", alt.Spec.SecretName)
++	assert.True(t, certNotFound(ctx, t, cl, "my-ingress-tls"))
++
++	// Once the preferred can be created, migration succeeds without a gap.
++	require.Nil(t, certIntegration(cl).UpdateResource(ctx, owner, certInfo()))
++	assert.False(t, certNotFound(ctx, t, cl, "my-ingress-tls"))
++	assert.True(t, certNotFound(ctx, t, cl, altName))
++}
++
++func TestCertCleanupPreservesForeignObjects(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(nil)
++	cl := newOwnershipFakeClient(owner)
++	altName := AlternativeName("my-ingress-tls", owner.UID)
++
++	foreign := &certmanager.Certificate{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress-tls",
++			Namespace: ownershipTestNamespace,
++			Labels:    map[string]string{"owner": "platform"},
++		},
++	}
++	require.Nil(t, cl.Create(ctx, foreign))
++	integration := certIntegration(cl)
++	require.Nil(t, integration.UpdateResource(ctx, owner, certInfo()))
++	assert.False(t, certNotFound(ctx, t, cl, altName))
++
++	// TLS/hosts disappear: only the UID-owned alternative is removed.
++	require.Nil(t, integration.UpdateResource(ctx, owner, IngressInfo{}))
++	preserved := mustGetCert(t, ctx, cl, "my-ingress-tls")
++	assert.Equal(t, "platform", preserved.Labels["owner"])
++	assert.Empty(t, preserved.OwnerReferences)
++	assert.True(t, certNotFound(ctx, t, cl, altName))
++}
++
++//-------------------------------------------------------------------------------------------------
++// DNS ENDPOINT INTEGRATION
++//-------------------------------------------------------------------------------------------------
++
++func TestDNSEndpointConflictAndMigration(t *testing.T) {
++	ctx := context.Background()
++	owner := ownershipOwner(map[string]string{"team": "platform"})
++	cl := newOwnershipFakeClient(owner)
++	altName := AlternativeName("my-ingress", owner.UID)
++
++	// Foreign, unmanaged endpoint at the preferred name.
++	foreign := &externaldnsv1alpha1.DNSEndpoint{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress",
++			Namespace: ownershipTestNamespace,
++			Labels:    map[string]string{"owner": "platform"},
++		},
++	}
++	require.Nil(t, cl.Create(ctx, foreign))
++
++	integration := dnsIntegration(cl)
++	info := IngressInfo{Hosts: []string{"example.com"}}
++	require.Nil(t, integration.UpdateResource(ctx, owner, info))
++
++	// Foreign endpoint preserved, alternative owned and functional.
++	preserved := mustGetEndpoint(t, ctx, cl, "my-ingress")
++	assert.Empty(t, preserved.OwnerReferences)
++	assert.Equal(t, "platform", preserved.Labels["owner"])
++
++	alt := mustGetEndpoint(t, ctx, cl, altName)
++	assert.Equal(t, owner.UID, alt.OwnerReferences[0].UID)
++	assert.Equal(t, "switchboard", alt.Labels[managedByLabelKey])
++	require.Len(t, alt.Spec.Endpoints, 1)
++	assert.Equal(t, "example.com", alt.Spec.Endpoints[0].DNSName)
++	assert.Equal(t, []string{"127.0.0.1"}, []string(alt.Spec.Endpoints[0].Targets))
++
++	// Stable across repeated reconciles.
++	require.Nil(t, integration.UpdateResource(ctx, owner, info))
++	assert.Len(t, listEndpoints(ctx, t, cl), 2)
++	assert.False(t, endpointNotFound(ctx, t, cl, altName))
++
++	// Preferred frees up: migrate back.
++	require.Nil(t, cl.Delete(ctx, foreign))
++	require.Nil(t, integration.UpdateResource(ctx, owner, info))
++	migrated := mustGetEndpoint(t, ctx, cl, "my-ingress")
++	assert.Equal(t, owner.UID, migrated.OwnerReferences[0].UID)
++	// Compatibility: newly created endpoints inherit the owner's annotations and labels.
++	assert.Equal(t, "platform", migrated.Annotations["team"])
++	assert.True(t, endpointNotFound(ctx, t, cl, altName))
++
++	// Cleanup with hosts gone while a foreign object occupies the preferred name: the foreign
++	// object stays and no alternative is created.
++	var currentPreferred externaldnsv1alpha1.DNSEndpoint
++	require.Nil(t, cl.Get(ctx, types.NamespacedName{
++		Namespace: ownershipTestNamespace,
++		Name:      "my-ingress",
++	}, &currentPreferred))
++	require.Nil(t, cl.Delete(ctx, &currentPreferred))
++	require.Nil(t, cl.Create(ctx, &externaldnsv1alpha1.DNSEndpoint{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "my-ingress",
++			Namespace: ownershipTestNamespace,
++			Labels:    map[string]string{"owner": "platform"},
++		},
++	}))
++	require.Nil(t, integration.UpdateResource(ctx, owner, IngressInfo{}))
++	preserved = mustGetEndpoint(t, ctx, cl, "my-ingress")
++	assert.Empty(t, preserved.OwnerReferences)
++	assert.Equal(t, "platform", preserved.Labels["owner"])
++	assert.True(t, endpointNotFound(ctx, t, cl, altName))
++}
++
++//-------------------------------------------------------------------------------------------------
++// HELPERS
++//-------------------------------------------------------------------------------------------------
++
++func ownershipOwner(annotations map[string]string) *v1.Service {
++	owner := k8tests.DummyService("my-ingress", ownershipTestNamespace, 80)
++	owner.UID = types.UID("owner-uid-1")
++	owner.Annotations = annotations
++	return &owner
++}
++
++func newOwnershipFakeClient(objs ...client.Object) client.Client {
++	return fake.NewClientBuilder().
++		WithScheme(k8tests.NewScheme()).
++		WithObjects(objs...).
++		Build()
++}
++
++func certIntegration(cl client.Client) Integration {
++	return NewCertManager(cl, certmanager.Certificate{
++		Spec: certmanager.CertificateSpec{
++			IssuerRef: cmmeta.IssuerReference{
++				Kind: "ClusterIssuer",
++				Name: "my-issuer",
++			},
++		},
++	})
++}
++
++func dnsIntegration(cl client.Client) Integration {
++	return NewExternalDNS(cl, switchboard.NewStaticTarget("127.0.0.1"), nil)
++}
++
++func certInfo() IngressInfo {
++	secret := "tls-secret"
++	return IngressInfo{Hosts: []string{"example.com"}, TLSSecretName: &secret}
++}
++
++func controllerRef(kind, apiVersion, name string, uid types.UID) metav1.OwnerReference {
++	control := true
++	blockDeletion := true
++	return metav1.OwnerReference{
++		APIVersion:         apiVersion,
++		Kind:               kind,
++		Name:               name,
++		UID:                uid,
++		Controller:         &control,
++		BlockOwnerDeletion: &blockDeletion,
++	}
++}
++
++func mustGetCert(
++	t *testing.T, ctx context.Context, cl client.Client, name string,
++) certmanager.Certificate {
++	t.Helper()
++	var cert certmanager.Certificate
++	require.Nil(t, cl.Get(ctx, types.NamespacedName{
++		Namespace: ownershipTestNamespace,
++		Name:      name,
++	}, &cert))
++	return cert
++}
++
++func certNotFound(ctx context.Context, t *testing.T, cl client.Client, name string) bool {
++	t.Helper()
++	var cert certmanager.Certificate
++	err := cl.Get(ctx, types.NamespacedName{
++		Namespace: ownershipTestNamespace,
++		Name:      name,
++	}, &cert)
++	if apierrors.IsNotFound(err) {
++		return true
++	}
++	require.Nil(t, err)
++	return false
++}
++
++func listCerts(ctx context.Context, t *testing.T, cl client.Client) []certmanager.Certificate {
++	t.Helper()
++	var list certmanager.CertificateList
++	require.Nil(t, cl.List(ctx, &list, client.InNamespace(ownershipTestNamespace)))
++	return list.Items
++}
++
++func mustGetEndpoint(
++	t *testing.T, ctx context.Context, cl client.Client, name string,
++) externaldnsv1alpha1.DNSEndpoint {
++	t.Helper()
++	var ep externaldnsv1alpha1.DNSEndpoint
++	require.Nil(t, cl.Get(ctx, types.NamespacedName{
++		Namespace: ownershipTestNamespace,
++		Name:      name,
++	}, &ep))
++	return ep
++}
++
++func endpointNotFound(ctx context.Context, t *testing.T, cl client.Client, name string) bool {
++	t.Helper()
++	var ep externaldnsv1alpha1.DNSEndpoint
++	err := cl.Get(ctx, types.NamespacedName{
++		Namespace: ownershipTestNamespace,
++		Name:      name,
++	}, &ep)
++	if apierrors.IsNotFound(err) {
++		return true
++	}
++	require.Nil(t, err)
++	return false
++}
++
++func listEndpoints(
++	ctx context.Context, t *testing.T, cl client.Client,
++) []externaldnsv1alpha1.DNSEndpoint {
++	t.Helper()
++	var list externaldnsv1alpha1.DNSEndpointList
++	require.Nil(t, cl.List(ctx, &list, client.InNamespace(ownershipTestNamespace)))
++	return list.Items
++}
++
++func hasSuffix(s, suffix string) bool {
++	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
++}
++
++func repeat(s string, n int) string {
++	result := make([]byte, n)
++	for i := range result {
++		result[i] = s[0]
++	}
++	return string(result)
++}
++
++func indexOf(items []string, target string) int {
++	for i, item := range items {
++		if item == target {
++			return i
++		}
++	}
++	return -1
++}
++
++// opTrackingClient records creates and deletes.
++type opTrackingClient struct {
++	client.Client
++	ops *[]string
++}
++
++func (c *opTrackingClient) Create(
++	ctx context.Context, obj client.Object, opts ...client.CreateOption,
++) error {
++	*c.ops = append(*c.ops, "create:"+obj.GetName())
++	return c.Client.Create(ctx, obj, opts...)
++}
++
++func (c *opTrackingClient) Delete(
++	ctx context.Context, obj client.Object, opts ...client.DeleteOption,
++) error {
++	*c.ops = append(*c.ops, "delete:"+obj.GetName())
++	return c.Client.Delete(ctx, obj, opts...)
++}
++
++// createFailingClient fails creation of a single resource name.
++type createFailingClient struct {
++	client.Client
++	groupResource schema.GroupResource
++	failName      string
++}
++
++func (c *createFailingClient) Create(
++	ctx context.Context, obj client.Object, opts ...client.CreateOption,
++) error {
++	if obj.GetName() == c.failName {
++		return apierrors.NewAlreadyExists(c.groupResource, c.failName)
++	}
++	return c.Client.Create(ctx, obj, opts...)
++}
+diff --git a/internal/integrations/utils.go b/internal/integrations/utils.go
+index f46b0f2..8d5ec7f 100644
+--- a/internal/integrations/utils.go
++++ b/internal/integrations/utils.go
+@@ -1,14 +1,27 @@
+ package integrations
+ 
+ import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"fmt"
++	"maps"
++	"strings"
+ 
+ 	"dario.cat/mergo"
++	"github.com/borchero/switchboard/internal/k8s"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
+ 	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
++// resourceNameMaxLength is the maximum length of a DNS-1123 subdomain name as used by the
++// resources managed by integrations.
++const resourceNameMaxLength = 253
++
+ func reconcileMetadata(
+ 	owner metav1.Object, target metav1.Object, scheme *runtime.Scheme, sources ...metav1.Object,
+ ) error {
+@@ -49,3 +62,227 @@ func defaultEmpty(m map[string]string) map[string]string {
+ 	}
+ 	return m
+ }
++
++//-------------------------------------------------------------------------------------------------
++// OWNERSHIP
++//-------------------------------------------------------------------------------------------------
++
++// childResources contains the typed accessors that are required to generically reconcile the
++// single child resource of an integration (e.g. a Certificate or a DNSEndpoint).
++type childResources struct {
++	client    client.Client
++	scheme    *runtime.Scheme
++	newObject func(namespace, name string) client.Object
++	newList   func() client.ObjectList
++	listItems func(client.ObjectList) []client.Object
++}
++
++// reconcile ensures that the child resource derived from the given owner matches the desired
++// state. Resource identity is determined solely by the controller ownerReference's kind, name and
++// UID - never by the resource name alone.
++//
++// If want is false, all children controlled by the current owner UID are deleted while foreign
++// resources sharing the preferred or alternative name are preserved.
++//
++// If want is true, reconcile uses the preferred name when it is free or owned by the current
++// owner UID. If the preferred name is occupied by a foreign resource (no controller, another
++// controller, or a stale UID), the foreign resource is preserved untouched and a deterministic
++// alternative name is used instead. When the preferred name becomes available again, the
++// preferred child is created or repaired first and only then the UID-owned alternative child is
++// removed - a failed preferred upsert never invalidates the still-serving alternative.
++func (r childResources) reconcile(
++	ctx context.Context,
++	owner metav1.Object,
++	preferred string,
++	want bool,
++	mutate func(client.Object) error,
++) error {
++	kind, err := ownerKind(r.scheme, owner)
++	if err != nil {
++		return err
++	}
++
++	namespace := owner.GetNamespace()
++	ownerName := owner.GetName()
++	ownerUID := owner.GetUID()
++
++	// Find all children currently controlled by this exact owner identity (kind/name/UID).
++	owned, err := r.ownedBy(ctx, namespace, kind, ownerName, ownerUID)
++	if err != nil {
++		return fmt.Errorf("failed to list owned resources: %w", err)
++	}
++
++	if !want {
++		// Cleanup: only remove children controlled by the current UID. Foreign resources that
++		// happen to share the preferred or alternative name are preserved.
++		for _, child := range owned {
++			if err := k8s.DeleteIfFound(ctx, r.client, child); err != nil {
++				return fmt.Errorf("failed to delete owned resource %q: %w", child.GetName(), err)
++			}
++		}
++		return nil
++	}
++
++	alternative := AlternativeName(preferred, ownerUID)
++
++	preferredObj, preferredFound, err := r.find(ctx, namespace, preferred)
++	if err != nil {
++		return fmt.Errorf("failed to look up preferred resource %q: %w", preferred, err)
++	}
++	alternativeObj, alternativeFound, err := r.find(ctx, namespace, alternative)
++	if err != nil {
++		return fmt.Errorf("failed to look up alternative resource %q: %w", alternative, err)
++	}
++
++	if preferredFound && !controlledBy(preferredObj, kind, ownerName, ownerUID) {
++		// The preferred name is occupied by a foreign resource (without controller, controlled
++		// by another controller, or controlled by a stale owner UID). It must be preserved
++		// untouched and we use the stable alternative name instead.
++		if alternativeFound && !controlledBy(alternativeObj, kind, ownerName, ownerUID) {
++			return fmt.Errorf(
++				"preferred resource %q and alternative resource %q are both controlled by "+
++					"another owner",
++				preferred, alternative,
++			)
++		}
++		target := r.newObject(namespace, alternative)
++		if alternativeFound {
++			target = alternativeObj
++		}
++		if err := r.upsert(ctx, target, mutate); err != nil {
++			return fmt.Errorf("failed to upsert alternative resource %q: %w", alternative, err)
++		}
++		return r.deleteStrays(ctx, owned, alternative)
++	}
++
++	// The preferred name is free or already ours: create or repair the preferred child first.
++	target := r.newObject(namespace, preferred)
++	if preferredFound {
++		target = preferredObj
++	}
++	if err := r.upsert(ctx, target, mutate); err != nil {
++		// Do not delete the alternative child: it may still serve traffic. The returned error
++		// triggers a retry which reattempts moving to the preferred name without a gap.
++		return fmt.Errorf("failed to upsert preferred resource %q: %w", preferred, err)
++	}
++
++	// The preferred child is healthy: only now remove any UID-owned alternative child.
++	return r.deleteStrays(ctx, owned, preferred)
++}
++
++func (r childResources) upsert(
++	ctx context.Context, obj client.Object, mutate func(client.Object) error,
++) error {
++	if obj.GetResourceVersion() == "" {
++		if err := mutate(obj); err != nil {
++			return err
++		}
++		return r.client.Create(ctx, obj)
++	}
++
++	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
++	if err := mutate(obj); err != nil {
++		return err
++	}
++	return r.client.Patch(ctx, obj, patch)
++}
++
++func (r childResources) find(
++	ctx context.Context, namespace, name string,
++) (client.Object, bool, error) {
++	obj := r.newObject(namespace, name)
++	if err := r.client.Get(ctx, types.NamespacedName{
++		Namespace: namespace,
++		Name:      name,
++	}, obj); err != nil {
++		if !apierrors.IsNotFound(err) {
++			return nil, false, err
++		}
++		return nil, false, nil
++	}
++	return obj, true, nil
++}
++
++func (r childResources) ownedBy(
++	ctx context.Context, namespace, kind, name string, uid types.UID,
++) ([]client.Object, error) {
++	list := r.newList()
++	if err := r.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
++		return nil, err
++	}
++	items := r.listItems(list)
++	result := make([]client.Object, 0, len(items))
++	for _, item := range items {
++		if controlledBy(item, kind, name, uid) {
++			result = append(result, item)
++		}
++	}
++	return result, nil
++}
++
++func (r childResources) deleteStrays(
++	ctx context.Context, owned []client.Object, keep string,
++) error {
++	for _, child := range owned {
++		if child.GetName() == keep {
++			continue
++		}
++		if err := k8s.DeleteIfFound(ctx, r.client, child); err != nil {
++			return fmt.Errorf("failed to delete stale owned resource %q: %w", child.GetName(), err)
++		}
++	}
++	return nil
++}
++
++// ownerKind resolves the kind of the given owner object using the provided scheme - mirroring
++// how controllerutil.SetControllerReference derives the ownerReference kind.
++func ownerKind(scheme *runtime.Scheme, owner metav1.Object) (string, error) {
++	ro, ok := owner.(runtime.Object)
++	if !ok {
++		return "", fmt.Errorf("owner %T does not implement runtime.Object", owner)
++	}
++	gvks, _, err := scheme.ObjectKinds(ro)
++	if err != nil {
++		return "", fmt.Errorf("failed to resolve owner kind: %w", err)
++	}
++	return gvks[0].Kind, nil
++}
++
++// controlledBy reports whether the given object has a controller ownerReference matching the
++// provided kind, name and UID. Objects without a controller reference or with a controller
++// reference of another kind, name or UID (e.g. a same-named owner that was recreated with a new
++// UID) are not considered controlled.
++func controlledBy(obj client.Object, kind, name string, uid types.UID) bool {
++	ref := metav1.GetControllerOf(obj)
++	if ref == nil {
++		return false
++	}
++	return ref.Kind == kind && ref.Name == name && ref.UID == uid
++}
++
++// AlternativeName returns a deterministic, DNS-1123-legal child name derived from the preferred
++// name and the owner's UID. The same owner always maps to the same alternative across retries and
++// manager restarts while distinct UIDs (e.g. a same-named IngressRoute recreated after deletion)
++// map to distinct alternatives.
++func AlternativeName(preferred string, uid types.UID) string {
++	sum := sha256.Sum256([]byte(uid))
++	suffix := hex.EncodeToString(sum[:8]) // 16 lowercase hexadecimal characters
++
++	maxBody := resourceNameMaxLength - len(suffix) - 1
++	body := preferred
++	if len(body) > maxBody {
++		body = body[:maxBody]
++	}
++	// The suffix starts with a hexadecimal character, so we only need to ensure the body does
++	// not end with a dash to keep the composed name legal.
++	body = strings.TrimRight(body, "-")
++	return body + "-" + suffix
++}
++
++// cloneAnnotations returns a shallow copy of the provided annotations map.
++func cloneAnnotations(annotations map[string]string) map[string]string {
++	if len(annotations) == 0 {
++		return nil
++	}
++	return maps.Clone(annotations)
++}
+diff --git a/internal/k8s/enqueue.go b/internal/k8s/enqueue.go
+index cf60dd5..ef62ea4 100644
+--- a/internal/k8s/enqueue.go
++++ b/internal/k8s/enqueue.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"log/slog"
+ 
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ )
+@@ -42,3 +44,37 @@ func EnqueueMapFunc[L client.ObjectList](
+ 		return requests
+ 	}
+ }
++
++// EnqueuePreferredOwnerFunc returns a map function for child resource events which enqueues
++// exactly the single owner whose preferred child name matches the event object's name. It is used
++// to watch child resources (including resources not owned by this controller) so that updates or
++// deletions of a foreign object occupying an owner's preferred name trigger the reconciliation
++// of precisely that owner. Events for resources unrelated to any existing owner - including
++// arbitrary foreign resources - produce no requests and never cause a full reconciliation.
++func EnqueuePreferredOwnerFunc(
++	logger *slog.Logger,
++	ctrlClient client.Client,
++	newOwner func() client.Object,
++	resolve func(childName string) (ownerName string, ok bool),
++) func(context.Context, client.Object) []reconcile.Request {
++	return func(ctx context.Context, obj client.Object) []reconcile.Request {
++		ownerName, ok := resolve(obj.GetName())
++		if !ok {
++			return nil
++		}
++
++		key := types.NamespacedName{
++			Namespace: obj.GetNamespace(),
++			Name:      ownerName,
++		}
++		owner := newOwner()
++		if err := ctrlClient.Get(ctx, key, owner); err != nil {
++			if !apierrors.IsNotFound(err) {
++				logger.Error("failed to look up owner for child resource event",
++					"resource", obj.GetName(), "error", err)
++			}
++			return nil
++		}
++		return []reconcile.Request{{NamespacedName: key}}
++	}
++}
+diff --git a/internal/k8s/enqueue_test.go b/internal/k8s/enqueue_test.go
+index 2fe3c0b..b648e49 100644
+--- a/internal/k8s/enqueue_test.go
++++ b/internal/k8s/enqueue_test.go
+@@ -3,14 +3,21 @@ package k8s
+ import (
+ 	"context"
+ 	"log/slog"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/borchero/switchboard/internal/ext"
+ 	"github.com/borchero/switchboard/internal/k8tests"
++	certmanager "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	traefik "github.com/traefik/traefik/v3/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
+ 	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ )
+ 
+ func TestEnqueueMapFunc(t *testing.T) {
+@@ -57,3 +64,59 @@ func TestEnqueueMapFunc(t *testing.T) {
+ 	}
+ 	assert.ElementsMatch(t, names, found)
+ }
++
++func TestEnqueuePreferredOwnerFunc(t *testing.T) {
++	ctx := context.Background()
++	scheme := k8tests.NewScheme()
++	namespace := "preferred-owner"
++
++	ingress := &traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{Name: "my-ingress", Namespace: namespace},
++	}
++	other := &traefik.IngressRoute{
++		ObjectMeta: metav1.ObjectMeta{Name: "other-ingress", Namespace: namespace},
++	}
++	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ingress, other).Build()
++
++	newOwner := func() client.Object { return &traefik.IngressRoute{} }
++
++	// Certificate resolver: preferred child names end with "-tls".
++	certResolve := func(name string) (string, bool) {
++		if !strings.HasSuffix(name, "-tls") {
++			return "", false
++		}
++		return strings.TrimSuffix(name, "-tls"), true
++	}
++	certEnqueuer := EnqueuePreferredOwnerFunc(slog.Default(), cl, newOwner, certResolve)
++
++	certEvent := func(name string) client.Object {
++		return &certmanager.Certificate{ObjectMeta: metav1.ObjectMeta{
++			Name: name, Namespace: namespace,
++		}}
++	}
++
++	// Foreign certificate occupying the preferred name enqueues precisely the single route.
++	assert.Equal(t, []reconcile.Request{{
++		NamespacedName: types.NamespacedName{Name: "my-ingress", Namespace: namespace},
++	}}, certEnqueuer(ctx, certEvent("my-ingress-tls")))
++
++	// A preferred name without a matching IngressRoute enqueues nothing.
++	assert.Empty(t, certEnqueuer(ctx, certEvent("missing-ingress-tls")))
++
++	// Names not matching the preferred pattern enqueue nothing.
++	assert.Empty(t, certEnqueuer(ctx, certEvent("plain-name")))
++
++	// Other namespaces cannot enqueue the route.
++	assert.Empty(t, certEnqueuer(ctx, &certmanager.Certificate{ObjectMeta: metav1.ObjectMeta{
++		Name: "my-ingress-tls", Namespace: "other-namespace",
++	}}))
++
++	// DNSEndpoint resolver: preferred name is identical to the route name.
++	dnsEnqueuer := EnqueuePreferredOwnerFunc(slog.Default(), cl, newOwner,
++		func(name string) (string, bool) { return name, true },
++	)
++	assert.Equal(t, []reconcile.Request{{
++		NamespacedName: types.NamespacedName{Name: "other-ingress", Namespace: namespace},
++	}}, dnsEnqueuer(ctx, certEvent("other-ingress")))
++	assert.Empty(t, dnsEnqueuer(ctx, certEvent("unknown-ingress")))
++}
